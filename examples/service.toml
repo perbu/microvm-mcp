@@ -1,0 +1,16 @@
+state_dir = "/var/lib/microvm-mcp"
+firecracker = "/opt/microvm-mcp/firecracker"
+jailer = "/opt/microvm-mcp/jailer"
+kernel = "/opt/microvm-mcp/vmlinux"
+rootfs = "/var/lib/microvm-images/debian-13.ext4"
+image_id = "debian-13-dev-v1"
+rootfs_sha256 = "REPLACE_WITH_BUILT_IMAGE_SHA256"
+kernel_sha256 = "REPLACE_WITH_PINNED_KERNEL_SHA256"
+uid_base = 62000
+max_vms = 16
+max_memory_mib = 16384
+max_storage_gib = 64
+port = 8090
+# uplink = "eth0"  # required only for network=on; IPv4 forwarding must already be enabled
+# blocked_cidrs = ["YOUR_PUBLIC_MANAGEMENT_SUBNET/24"]
+# allowed_hosts = ["127.0.0.1:8090", "vms.example.com"]  # TLS reverse proxy Host header

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "microvm-mcp"
+version = "0.1.0"
+description = "Workspace-authorized Linux development microVMs over MCP and HTTP"
+requires-python = ">=3.11"
+dependencies = ["mcp==2.2.0", "jsonschema>=4.26,<5", "uvicorn>=0.53,<0.54"]
+
+[project.scripts]
+microvm-mcp = "microvm_mcp.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=9,<10", "ruff>=0.16,<0.17"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

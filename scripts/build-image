@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Builds trusted image author code in Docker. Does not run customer commands on the host.
+set -euo pipefail
+here=$(cd -- "$(dirname -- "$0")/.." && pwd)
+output=${1:?Usage: build-image /absolute/output/directory}
+mkdir -p "$output"
+output=$(realpath "$output")
+stage=$(mktemp -d)
+container=""
+cleanup() {
+    if [ -n "$container" ]; then docker rm "$container" >/dev/null; fi
+    rm -rf "$stage"
+}
+trap cleanup EXIT
+docker build -t microvm-mcp-debian:13 "$here/guest"
+container=$(docker create microvm-mcp-debian:13)
+docker export "$container" -o "$stage/rootfs.tar"
+mkdir "$stage/root"
+# Run as root to preserve guest UID 1000. Never extract an untrusted guest export.
+tar --numeric-owner -xf "$stage/rootfs.tar" -C "$stage/root"
+truncate -s 3G "$output/debian-13.ext4"
+mkfs.ext4 -q -F -d "$stage/root" "$output/debian-13.ext4"
+sha256sum "$output/debian-13.ext4" > "$output/debian-13.ext4.sha256"
+docker image inspect microvm-mcp-debian:13 --format '{{.Id}}' > "$output/image-build-id"
+echo "Built Debian image in $output; pin its digest in service.toml."
