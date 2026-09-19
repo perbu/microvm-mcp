@@ -23,6 +23,8 @@ FILE_LIMIT = 128 * 1024
 JOBS = {}
 MANAGED_PIDS = set()
 LOCK = threading.RLock()
+SUSPENDED_AT = None
+LIFECYCLE_PROTOCOL = 1
 
 
 def workspace_path(path):
@@ -76,8 +78,7 @@ def execute_child(group, cwd, command, ready_fd):
     )
 
 
-def supervise(job, process, group, timeout):
-    deadline = time.monotonic() + timeout
+def supervise(job, process, group):
     selector = selectors.DefaultSelector()
     for stream in ("stdout", "stderr"):
         pipe = getattr(process, stream)
@@ -85,9 +86,10 @@ def supervise(job, process, group, timeout):
         selector.register(pipe, selectors.EVENT_READ, stream)
     try:
         while True:
-            if time.monotonic() >= deadline:
-                (group / "cgroup.kill").write_text("1")
-                job["timed_out"] = True
+            with LOCK:
+                if SUSPENDED_AT is None and time.monotonic() >= job["deadline"]:
+                    (group / "cgroup.kill").write_text("1")
+                    job["timed_out"] = True
             for key, _ in selector.select(0.1):
                 data = os.read(key.fd, 16384)
                 if not data:
@@ -153,14 +155,67 @@ def read_output(job, args):
     return result
 
 
+def prepare_suspend():
+    """Freeze all customer descendants before the VMM stops or time is corrected."""
+    global SUSPENDED_AT
+    if SUSPENDED_AT is None:
+        SUSPENDED_AT = time.monotonic()
+    (CGROUP / "cgroup.freeze").write_text("1")
+    deadline = time.monotonic() + 5
+    while "frozen 1" not in (CGROUP / "cgroup.events").read_text().splitlines():
+        if time.monotonic() >= deadline:
+            # Leave timeout handling disabled and the group frozen on failure.
+            raise ValueError("guest jobs did not freeze")
+        time.sleep(0.01)
+    return {"frozen": True}
+
+
+def sync_clock(realtime_ns):
+    """Host-only RPC: correct wall time before thawing jobs; preserve timeout budgets."""
+    global SUSPENDED_AT
+    if type(realtime_ns) is not int or not 0 <= realtime_ns < 2**63:
+        raise ValueError("invalid host time")
+    # CLOCK_REALTIME changes do not advance CLOCK_MONOTONIC or relative timers.
+    time.clock_settime_ns(time.CLOCK_REALTIME, realtime_ns)
+    if SUSPENDED_AT is not None:
+        elapsed = time.monotonic() - SUSPENDED_AT
+        if elapsed < 0:
+            raise ValueError("guest monotonic clock moved backwards")
+        # The caller holds LOCK, so timeout threads cannot race the adjustment.
+        # If setting time or thawing fails, retain the suspended state.
+        (CGROUP / "cgroup.freeze").write_text("0")
+        for job in JOBS.values():
+            if job["state"] == "running":
+                job["deadline"] += elapsed
+        SUSPENDED_AT = None
+    return {"synchronized": True}
+
+
 def handle(op, args):
     with LOCK:
+        if op == "prepare_suspend":
+            return prepare_suspend()
+        if op == "sync_clock":
+            return sync_clock(args["realtime_ns"])
+        if op == "clock_status":
+            return {
+                "realtime_ns": time.time_ns(),
+                "monotonic_ns": time.monotonic_ns(),
+                "clocksource": Path(
+                    "/sys/devices/system/clocksource/clocksource0/current_clocksource"
+                )
+                .read_text()
+                .strip(),
+            }
         if op == "status":
             return {
+                "lifecycle_protocol": LIFECYCLE_PROTOCOL,
                 "active": any(j["state"] == "running" for j in JOBS.values()),
                 "jobs": {key: summary(j) for key, j in JOBS.items()},
             }
         if op == "exec":
+            if SUSPENDED_AT is not None:
+                raise ValueError("guest jobs are frozen")
             job_id = args["job_id"]
             if len(job_id) != 32 or any(c not in "0123456789abcdef" for c in job_id):
                 raise ValueError("bad job id")
@@ -184,6 +239,7 @@ def handle(op, args):
                 "stderr": bytearray(),
                 "eof": set(),
                 "group": group,
+                "deadline": time.monotonic() + args["timeout_seconds"],
             }
             ready_read, ready_write = os.pipe()
             try:
@@ -219,9 +275,7 @@ def handle(op, args):
                     os.close(ready_write)
             MANAGED_PIDS.add(process.pid)
             JOBS[job_id] = job
-            threading.Thread(
-                target=supervise, args=(job, process, group, args["timeout_seconds"]), daemon=True
-            ).start()
+            threading.Thread(target=supervise, args=(job, process, group), daemon=True).start()
             return {"job_id": job_id}
         if op in ("job_status", "job_output", "job_cancel"):
             job = JOBS[args["job_id"]]

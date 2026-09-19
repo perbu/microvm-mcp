@@ -20,6 +20,7 @@ from .network import Network, names
 
 FICLONE = 0x40049409
 MAX_FRAME = 512 * 1024
+LIFECYCLE_PROTOCOL = 1
 
 
 def clone(source, destination):
@@ -258,6 +259,8 @@ class Firecracker:
                 )
             self.api(vm, "PUT", "/actions", {"action_type": "InstanceStart"})
             self.wait_guest(vm)
+            self.sync_clock(vm)
+            vm["lifecycle_protocol"] = LIFECYCLE_PROTOCOL
         except Exception:
             self.stop(vm)
             self.network.destroy(vm)
@@ -294,14 +297,38 @@ class Firecracker:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
-                self.guest(vm, "status", {}, timeout=1)
-                return
+                status = self.guest(vm, "status", {}, timeout=1)
             except (OSError, ValueError, ServiceError):
                 time.sleep(0.1)
+                continue
+            if status.get("lifecycle_protocol") != LIFECYCLE_PROTOCOL:
+                raise ServiceError(
+                    "incompatible_guest", "Rebuild the guest image for clock synchronization", 409
+                )
+            return
         raise ServiceError("boot_timeout", "Guest supervisor did not become ready", 504)
 
+    def sync_clock(self, vm):
+        # Send only host wall time, never workspace credentials. Jobs stay frozen
+        # until the supervisor corrects CLOCK_REALTIME and their timeout budgets.
+        result = self.guest(vm, "sync_clock", {"realtime_ns": time.time_ns()})
+        if result.get("synchronized") is not True:
+            raise ServiceError("guest_protocol", "Guest clock synchronization failed", 502)
+
     def suspend(self, vm, mode, previous):
+        try:
+            self._suspend(vm, mode, previous)
+        except Exception:
+            # A failed freeze/checkpoint must not leave an untracked runnable VM.
+            self.stop(vm)
+            self.network.destroy(vm)
+            raise
+
+    def _suspend(self, vm, mode, previous):
         if previous != "paused":
+            result = self.guest(vm, "prepare_suspend", {})
+            if result.get("frozen") is not True:
+                raise ServiceError("guest_protocol", "Guest jobs did not freeze", 502)
             self.api(vm, "PATCH", "/vm", {"state": "Paused"})
         if mode == "pause":
             return
@@ -333,12 +360,17 @@ class Firecracker:
         self.network.destroy(vm)
 
     def resume(self, vm, previous):
-        if previous == "paused":
-            self.api(vm, "PATCH", "/vm", {"state": "Resumed"})
-            self.wait_guest(vm)
-            return
-        self.network.create(vm)
+        if vm.get("lifecycle_protocol") != LIFECYCLE_PROTOCOL:
+            raise ServiceError(
+                "incompatible_guest", "Recreate this VM with the clock-aware guest image", 409
+            )
         try:
+            if previous == "paused":
+                self.api(vm, "PATCH", "/vm", {"state": "Resumed"})
+                self.wait_guest(vm)
+                self.sync_clock(vm)
+                return
+            self.network.create(vm)
             self.launch(vm)
             self.api(
                 vm,
@@ -349,10 +381,13 @@ class Firecracker:
                     "mem_backend": {"backend_type": "File", "backend_path": "/memory"},
                     "enable_diff_snapshots": False,
                     "resume_vm": True,
-                    "clock_realtime": True,
+                    # Advancing kvm-clock also advances monotonic timers. Correct
+                    # CLOCK_REALTIME separately, independent of the clocksource.
+                    "clock_realtime": False,
                 },
             )
             self.wait_guest(vm)
+            self.sync_clock(vm)
         except Exception:
             self.stop(vm)
             self.network.destroy(vm)

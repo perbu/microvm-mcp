@@ -201,7 +201,28 @@ Manual suspend defaults to `mode="hibernate"` and refuses active jobs. With
 `force=true`, it freezes them. VM status, list and cached job status never wake a
 suspended VM. Execution, file transfers, output retrieval and cancellation do.
 Cancellation of a frozen job resumes the guest before terminating its cgroup.
-Guest command timeouts measure active guest time; suspension can extend wall time.
+Managed command timeouts exclude suspension; suspension can extend wall time.
+
+Before stopping vCPUs, the supervisor freezes the managed jobs' entire cgroup
+subtree and pauses timeout accounting. On boot and every resume, the host sends
+its current wall time through the private vsock control channel. The guest sets
+`CLOCK_REALTIME` before thawing jobs, and restores their remaining timeout budgets
+under the supervisor lock before timeout checks resume. This works with both
+`tsc` and `kvm-clock`, including network-off VMs. Failed synchronization stops
+the VMM and marks the VM failed.
+Old images/checkpoints without this lifecycle protocol are rejected; rebuild and
+pin the guest image and create new VMs when upgrading.
+
+Firecracker's `clock_realtime` snapshot option is deliberately disabled: with
+`kvm-clock`, it also advances monotonic time across a restore. Wall time is instead
+corrected separately, without changing the monotonic clock. This is a correction
+at boot/resume, subject to local control-channel latency, not continuous NTP/PTP
+synchronization; the host clock must itself be accurate. Applications' own
+timers and sleeps still follow guest kernel semantics: plain pause advances
+monotonic time, while hibernation normally excludes time spent stopped. The
+supervisor compensates its managed command timeouts for either behavior, but
+does not rewrite application timers. Wall-clock deadlines can expire during
+suspension.
 
 Hibernation pauses the guest, writes a full memory/device checkpoint, drains disk
 I/O, retains the corresponding private disk, fsyncs checkpoint metadata, stops
@@ -267,14 +288,19 @@ uv run --locked ruff format --check src guest tests scripts examples
 uv run --locked pytest
 # Run on a provisioned host. Missing KVM, jailer, reflinks etc. are hard failures.
 sudo .venv/bin/python scripts/smoke.py --config /etc/microvm-mcp.toml --network
+# Longer suspension probes, including jobs with a three-second timeout:
+sudo .venv/bin/python scripts/smoke.py --config /etc/microvm-mcp.toml \
+  --network --clock-suspend-seconds 30
 ```
 
 The unit suite uses a fake backend that cannot execute code. The separate real
 smoke boots jailed VMs, checks Fibonacci output, separate streams, UTF-8 pagination,
 binary output, and output limits, compiles generated C, checks disk isolation, preserves a
-running process across suspension, checks automatic hibernation, verifies network
-policy, and denies cross-workspace access. It deletes its VMs and revokes its
-credentials in cleanup. See `VALIDATION.md` for measured results and known smoke failures.
+running process across suspension, checks wall time and managed timeouts across
+pause, hibernation, and pause-to-hibernate transitions, checks automatic
+hibernation, verifies network policy, and denies cross-workspace access. It deletes
+its VMs and revokes its credentials in cleanup. See `VALIDATION.md` for measured
+results and the history of smoke failures and fixes.
 
 ## License
 

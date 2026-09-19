@@ -23,7 +23,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--network", action="store_true", help="also require public egress")
+    parser.add_argument(
+        "--clock-suspend-seconds",
+        type=float,
+        default=5,
+        help="duration of each clock/timeout suspension probe (minimum 5 seconds)",
+    )
     args = parser.parse_args()
+    if not 5 <= args.clock_suspend_seconds <= 3600:
+        parser.error("--clock-suspend-seconds must be between 5 and 3600")
     os.umask(0o077)
     config = tomllib.loads(args.config.read_text())
     store = Store(config["state_dir"])
@@ -88,6 +96,71 @@ def main():
         assert output["exit_code"] == 0, output
         assert not output["truncated"] and not output["timed_out"], output
         return output["stdout"]
+
+    def check_clock(vm_id, label):
+        # Bracket a direct guest sample, excluding command launch, exit polling,
+        # output retrieval, and integer-second rounding from the error budget.
+        before = time.time_ns()
+        sample = backend.guest(service.vms[vm_id], "clock_status", {})
+        after = time.time_ns()
+        earliest = (sample["realtime_ns"] - after) / 1e9
+        latest = (sample["realtime_ns"] - before) / 1e9
+        assert -0.25 <= earliest <= latest <= 0.25, {
+            "label": label,
+            "guest": sample,
+            "host_before_ns": before,
+            "host_after_ns": after,
+            "skew_seconds": [earliest, latest],
+        }
+        check(f"{label}: clock={sample['clocksource']} skew=[{earliest:.6f}, {latest:.6f}]s")
+
+    def check_suspended_timeout(vm_id, mode):
+        # The file gate keeps the command alive until the test explicitly releases
+        # it. Suspension exceeds its entire three-second active timeout budget.
+        gate = "release-" + uuid.uuid4().hex
+        command = (
+            'python3 -u -c \'import pathlib, time; print("ready"); '
+            f'p=pathlib.Path("{gate}"); '
+            'exec("while not p.exists(): time.sleep(0.01)"); print(time.time_ns())\''
+        )
+        job = call(
+            "vm_exec", vm_id=vm_id, request_id=uuid.uuid4().hex, command=command, timeout_seconds=3
+        )
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            output = call("vm_job_output", vm_id=vm_id, **job)
+            if "ready" in output["stdout"]:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("clock probe did not become ready")
+        call(
+            "vm_suspend",
+            vm_id=vm_id,
+            mode="pause" if mode == "pause-to-hibernate" else mode,
+            force=True,
+        )
+        time.sleep(args.clock_suspend_seconds)
+        if mode == "pause-to-hibernate":
+            call("vm_suspend", vm_id=vm_id, mode="hibernate", force=True)
+        resumed_after = time.time_ns()
+        call("vm_resume", vm_id=vm_id)
+        check_clock(vm_id, mode)
+        status = call("vm_job_status", vm_id=vm_id, **job)
+        assert status["state"] == "running" and not status["timed_out"], status
+        call("vm_write_file", vm_id=vm_id, path=gate, data_base64="")
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            output = call("vm_job_output", vm_id=vm_id, **job)
+            if output["state"] == "completed":
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("clock probe did not finish")
+        assert output["exit_code"] == 0 and not output["timed_out"], output
+        guest_now = int(output["stdout"].splitlines()[-1])
+        assert resumed_after - 250_000_000 <= guest_now <= time.time_ns() + 250_000_000, output
+        check(f"{mode}: process survives suspension longer than its timeout")
 
     try:
         started = time.monotonic()
@@ -208,8 +281,12 @@ print("calculated 20 Fibonacci numbers", file=sys.stderr)
         output = call("vm_job_output", vm_id=vm, **job)
         assert "12345" in output["stdout"], output
         check("process memory and output survive forced suspend")
-        assert abs(int(execute(vm, "date +%s").strip()) - time.time()) < 2
-        check("guest wall clock corrected on restore")
+        check_clock(vm, "guest wall clock corrected after controller restart")
+        for mode in ("pause", "hibernate", "pause-to-hibernate"):
+            check_suspended_timeout(vm, mode)
+        output = execute_output(vm, "sleep 30", timeout=1)
+        assert output["timed_out"] and output["exit_code"] != 0, output
+        check("active job timeouts still enforced after repeated suspension")
         # An orphaned descendant must continue counting as activity after its shell exits.
         detached = call(
             "vm_exec",

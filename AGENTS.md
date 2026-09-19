@@ -28,6 +28,17 @@ changing the tool contract. Changes to guest code require rebuilding the image
 and pinning its digest before real-VM validation; old VMs and checkpoints do not
 automatically pick up supervisor changes.
 
+## Suspension and clocks
+
+Freeze the guest jobs cgroup before pausing vCPUs. Correct guest CLOCK_REALTIME
+from the host before thawing jobs, and restore managed timeout budgets under
+the supervisor lock before timeout checks resume. Never
+enable Firecracker clock_realtime as a substitute: its kvm-clock path also
+advances monotonic timers. Keep lifecycle protocol checks on new guests and
+restored checkpoints. Test both clock alignment and jobs suspended longer than
+their timeout, including pause-to-hibernate transitions. Preserve the distinction
+between managed timeout accounting and applications' own kernel timers.
+
 ## Validation and licensing
 
 Run the checks documented in README.md. Output changes need tests for stream
