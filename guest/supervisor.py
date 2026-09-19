@@ -2,6 +2,7 @@
 """Runs ONLY inside a full Linux guest. Never import as a host execution backend."""
 
 import base64
+import codecs
 import json
 import os
 import select
@@ -17,6 +18,7 @@ from pathlib import Path
 WORKSPACE = Path("/workspace")
 CGROUP = Path("/sys/fs/cgroup/jobs")
 OUTPUT_LIMIT = 256 * 1024
+OUTPUT_CHUNK = 16 * 1024  # Per stream: at most 32 KiB of source bytes per response.
 FILE_LIMIT = 128 * 1024
 JOBS = {}
 MANAGED_PIDS = set()
@@ -77,8 +79,10 @@ def execute_child(group, cwd, command, ready_fd):
 def supervise(job, process, group, timeout):
     deadline = time.monotonic() + timeout
     selector = selectors.DefaultSelector()
-    os.set_blocking(process.stdout.fileno(), False)
-    selector.register(process.stdout, selectors.EVENT_READ)
+    for stream in ("stdout", "stderr"):
+        pipe = getattr(process, stream)
+        os.set_blocking(pipe.fileno(), False)
+        selector.register(pipe, selectors.EVENT_READ, stream)
     try:
         while True:
             if time.monotonic() >= deadline:
@@ -88,10 +92,12 @@ def supervise(job, process, group, timeout):
                 data = os.read(key.fd, 16384)
                 if not data:
                     selector.unregister(key.fileobj)
+                    with LOCK:
+                        job["eof"].add(key.data)
                 else:
                     with LOCK:
-                        remaining = OUTPUT_LIMIT - len(job["output"])
-                        job["output"].extend(data[:remaining])
+                        remaining = OUTPUT_LIMIT - len(job["stdout"]) - len(job["stderr"])
+                        job[key.data].extend(data[:remaining])
                         job["truncated"] |= len(data) > remaining
             process.poll()  # reap the main child; descendants still count as activity
             if not populated(group) and not selector.get_map():
@@ -103,10 +109,48 @@ def supervise(job, process, group, timeout):
     finally:
         selector.close()
         process.stdout.close()
+        process.stderr.close()
 
 
 def summary(job):
     return {k: job[k] for k in ("state", "exit_code", "truncated", "timed_out")}
+
+
+def read_output(job, args):
+    """Stateless byte cursors; retain incomplete UTF-8 until its next bytes arrive."""
+    encoding = args.get("encoding", "utf-8")
+    if encoding not in ("utf-8", "base64"):
+        raise ValueError("unsupported output encoding")
+    cursor = args.get("cursor", {})
+    result = {"encoding": encoding, "next_cursor": {}, "decoding_errors": {}}
+    for stream in ("stdout", "stderr"):
+        start = cursor.get(stream, 0)
+        data = job[stream]
+        if not isinstance(start, int) or isinstance(start, bool) or not 0 <= start <= len(data):
+            raise ValueError("cursor beyond retained output")
+        chunk = bytes(data[start : start + OUTPUT_CHUNK])
+        if encoding == "base64":
+            result[stream + "_base64"] = base64.b64encode(chunk).decode("ascii")
+            consumed = len(chunk)
+        else:
+            final = start + len(chunk) == len(data) and (
+                stream in job["eof"] or job["truncated"] or job["state"] == "completed"
+            )
+            decoder = codecs.getincrementaldecoder("utf-8")("strict")
+            try:
+                text = decoder.decode(chunk, final=final)
+                invalid = False
+            except UnicodeDecodeError:
+                decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                text = decoder.decode(chunk, final=final)
+                invalid = True
+            consumed = len(chunk) - len(decoder.getstate()[0])
+            result[stream] = text
+            result["decoding_errors"][stream] = invalid
+        result["next_cursor"][stream] = start + consumed
+    if encoding == "base64":
+        del result["decoding_errors"]
+    return result
 
 
 def handle(op, args):
@@ -136,7 +180,9 @@ def handle(op, args):
                 "exit_code": None,
                 "truncated": False,
                 "timed_out": False,
-                "output": bytearray(),
+                "stdout": bytearray(),
+                "stderr": bytearray(),
+                "eof": set(),
                 "group": group,
             }
             ready_read, ready_write = os.pipe()
@@ -153,7 +199,7 @@ def handle(op, args):
                     ],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
+                    stderr=subprocess.PIPE,
                     start_new_session=True,
                     close_fds=True,
                     pass_fds=(ready_write,),
@@ -165,6 +211,7 @@ def handle(op, args):
                     (group / "cgroup.kill").write_text("1")
                     process.wait()
                     process.stdout.close()
+                    process.stderr.close()
                     raise ValueError("job could not enter its cgroup")
             finally:
                 os.close(ready_read)
@@ -182,13 +229,7 @@ def handle(op, args):
                 (job["group"] / "cgroup.kill").write_text("1")
             result = {"job_id": args["job_id"], **summary(job)}
             if op == "job_output":
-                cursor = args.get("cursor", 0)
-                if cursor > len(job["output"]):
-                    raise ValueError("cursor beyond retained output")
-                chunk = job["output"][cursor : cursor + 32768]
-                result.update(
-                    data_base64=base64.b64encode(chunk).decode(), next_cursor=cursor + len(chunk)
-                )
+                result.update(read_output(job, args))
             return result
         if op == "read_file":
             with os.fdopen(open_workspace(args["path"], os.O_RDONLY), "rb") as src:

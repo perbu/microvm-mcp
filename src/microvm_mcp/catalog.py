@@ -57,11 +57,22 @@ TOOLS = [
     ),
     tool(
         "vm_job_output",
-        "Read bounded combined stdout/stderr using a byte cursor; resumes the VM.",
+        "Read separate stdout/stderr as UTF-8 text (default) or base64. "
+        "Pass next_cursor back as cursor to continue; resumes the VM. "
+        "Invalid UTF-8 is replaced and flagged in decoding_errors.",
         {
             "vm_id": ID,
             "job_id": ID,
-            "cursor": {"type": "integer", "minimum": 0, "default": 0},
+            "cursor": {
+                "type": "object",
+                "properties": {
+                    "stdout": {"type": "integer", "minimum": 0},
+                    "stderr": {"type": "integer", "minimum": 0},
+                },
+                "additionalProperties": False,
+                "default": {"stdout": 0, "stderr": 0},
+            },
+            "encoding": {"enum": ["utf-8", "base64"], "default": "utf-8"},
         },
         ["vm_id", "job_id"],
     ),

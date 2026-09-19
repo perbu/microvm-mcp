@@ -45,7 +45,7 @@ def main():
         results.append(name)
         print("PASS", name, flush=True)
 
-    def execute(vm_id, command, timeout=20):
+    def execute_output(vm_id, command, timeout=20, encoding="utf-8"):
         job = call(
             "vm_exec",
             vm_id=vm_id,
@@ -57,12 +57,37 @@ def main():
         while time.monotonic() < deadline:
             status = call("vm_job_status", vm_id=vm_id, **job)
             if status["state"] == "completed":
-                output = call("vm_job_output", vm_id=vm_id, **job)
-                text = base64.b64decode(output["data_base64"]).decode(errors="replace")
-                assert status["exit_code"] == 0, (status, text)
-                return text
+                cursor = {"stdout": 0, "stderr": 0}
+                streams = {"stdout": [], "stderr": []}
+                errors = {"stdout": False, "stderr": False}
+                while True:
+                    output = call(
+                        "vm_job_output", vm_id=vm_id, cursor=cursor, encoding=encoding, **job
+                    )
+                    for stream in streams:
+                        if encoding == "base64":
+                            chunk = base64.b64decode(output[stream + "_base64"])
+                        else:
+                            chunk = output[stream]
+                            errors[stream] |= output["decoding_errors"][stream]
+                        streams[stream].append(chunk)
+                    if output["next_cursor"] == cursor:
+                        break
+                    cursor = output["next_cursor"]
+                empty = b"" if encoding == "base64" else ""
+                return {
+                    **status,
+                    **{k: empty.join(v) for k, v in streams.items()},
+                    "decoding_errors": errors,
+                }
             time.sleep(0.1)
         raise AssertionError("job did not complete")
+
+    def execute(vm_id, command, timeout=20):
+        output = execute_output(vm_id, command, timeout)
+        assert output["exit_code"] == 0, output
+        assert not output["truncated"] and not output["timed_out"], output
+        return output["stdout"]
 
     try:
         started = time.monotonic()
@@ -73,6 +98,59 @@ def main():
         check(f"jailed Debian boot ({time.monotonic() - started:.3f}s)")
         assert "uid=1000" in execute(vm, "id; python3 --version; node --version; gcc --version")
         check("unprivileged guest toolchains")
+        source = b"""import sys
+a, b = 0, 1
+values = []
+for _ in range(20):
+    values.append(a)
+    a, b = b, a + b
+print(*values, sep=", ")
+print("calculated 20 Fibonacci numbers", file=sys.stderr)
+"""
+        call(
+            "vm_write_file",
+            vm_id=vm,
+            path="fibonacci.py",
+            data_base64=base64.b64encode(source).decode(),
+        )
+        output = execute_output(vm, "python3 -u fibonacci.py")
+        assert output["stdout"] == (
+            "0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181\n"
+        ), output
+        assert output["stderr"] == "calculated 20 Fibonacci numbers\n", output
+        assert output["exit_code"] == 0 and not any(output["decoding_errors"].values()), output
+        check("Fibonacci with separate UTF-8 stdout and stderr")
+        output = execute_output(
+            vm, "python3 -c 'import sys; print(\"error\", file=sys.stderr); sys.exit(7)'"
+        )
+        assert output["stdout"] == "" and output["stderr"] == "error\n", output
+        assert output["exit_code"] == 7, output
+        check("stderr and nonzero exit code")
+        output = execute_output(
+            vm,
+            'python3 -c \'import os; os.write(1, b"a" * 16383 + "😀".encode()); '
+            'os.write(2, "ø".encode() * 20000)\'',
+        )
+        assert output["stdout"] == "a" * 16383 + "😀", output
+        assert output["stderr"] == "ø" * 20000, output
+        assert not any(output["decoding_errors"].values()), output
+        check("UTF-8 pagination across both pipes")
+        command = (
+            "python3 -c 'import os; os.write(1, bytes([255, 0, 226, 130])); "
+            "os.write(2, bytes([254]))'"
+        )
+        output = execute_output(vm, command)
+        assert output["stdout"] == "�\x00�" and output["stderr"] == "�", output
+        assert all(output["decoding_errors"].values()), output
+        output = execute_output(vm, command, encoding="base64")
+        assert output["stdout"] == b"\xff\x00\xe2\x82" and output["stderr"] == b"\xfe", output
+        check("invalid UTF-8 flagged and binary output preserved on request")
+        output = execute_output(
+            vm, 'python3 -c \'import os; os.write(1, b"x" * 300000); os.write(2, b"y" * 300000)\''
+        )
+        assert output["exit_code"] == 0 and output["truncated"], output
+        assert len(output["stdout"]) + len(output["stderr"]) == 256 * 1024
+        check("shared output cap drains both pipes without deadlock")
         try:
             service.call(other, "vm_exec", {"vm_id": vm, "command": "id", "request_id": "deny"})
             raise AssertionError("other workspace accessed VM")
@@ -128,7 +206,7 @@ def main():
                 break
             time.sleep(0.1)
         output = call("vm_job_output", vm_id=vm, **job)
-        assert b"12345" in base64.b64decode(output["data_base64"]), output
+        assert "12345" in output["stdout"], output
         check("process memory and output survive forced suspend")
         assert abs(int(execute(vm, "date +%s").strip()) - time.time()) < 2
         check("guest wall clock corrected on restore")

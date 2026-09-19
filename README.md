@@ -23,7 +23,8 @@ the existing `host_fetch` transport; no harness or demo code changes are require
   network namespaces, CPU/memory/PID limits, no host-directory mounts in the guest.
 - Reflink CoW raw ext4 disks on an XFS/Btrfs host filesystem. Unsupported storage
   fails preflight. Guest disks are fixed at the image's size (3 GiB in the recipe).
-- Async command handles; bounded combined stdout/stderr; cancellation/timeouts
+- Async command handles; separate stdout/stderr returned as readable UTF-8 text;
+  a shared output bound; cancellation/timeouts
   cover descendants through guest cgroups, including processes that call setsid.
 - Workspace file transfer using base64, bounded to 128 KiB per call, with symlink
   traversal refused. Larger artifacts can be inspected through command output;
@@ -130,9 +131,63 @@ Tools: `vm_create`, `vm_list`, `vm_status`, `vm_exec`, `vm_job_status`,
 `vm_job_output`, `vm_job_cancel`, `vm_read_file`, `vm_write_file`, `vm_suspend`,
 `vm_resume`, `vm_destroy`. Discovery advertises their complete JSON schemas.
 File paths and command working directories are relative to `/workspace`.
-`vm_job_output` returns `data_base64`, `next_cursor`, state, exit code, truncation
-and timeout flags. Output is retained up to 256 KiB/job, returned in 32 KiB chunks;
-there are at most four active jobs and 256 total jobs per VM.
+There are at most four active jobs and 256 total jobs per VM.
+
+### Reading command output
+
+`vm_exec` returns a `job_id`. Call `vm_job_output` while the job runs or after it
+finishes. Its default response contains separate, readable `stdout` and `stderr`
+strings; an LLM does not need to decode base64 to read command results:
+
+```json
+{
+  "job_id": "<returned job id>",
+  "encoding": "utf-8",
+  "stdout": "0, 1, 1, 2, 3, 5\n",
+  "stderr": "",
+  "next_cursor": {"stdout": 17, "stderr": 0},
+  "decoding_errors": {"stdout": false, "stderr": false},
+  "state": "completed",
+  "exit_code": 0,
+  "truncated": false,
+  "timed_out": false
+}
+```
+
+Omit `cursor` on the first call. Pass the entire returned `next_cursor` object
+as `cursor` on the next call, alongside `vm_id` and `job_id`. Each cursor field
+is a byte offset in that stream, not a character count. Omitted stream offsets
+start at zero. Reading is non-destructive: repeating a cursor rereads the same
+retained bytes. Once the job is completed, continue reading until neither offset
+advances. An empty response while the job is running is not end-of-output.
+
+The guest supervisor drains both pipes independently. Up to **256 KiB total** is
+retained across the two streams, with at most **16 KiB per stream per call**.
+Excess output is drained and discarded, with `truncated=true`; it does not block
+the command. Ordering within each stream is preserved; there is no ordering
+guarantee between stdout and stderr. Use `python3 -u` or explicit flushing when
+you want prompt output from Python.
+
+Text decoding preserves whitespace, line breaks, and tracebacks. Incomplete UTF-8
+characters at a page boundary or at the current end of a running stream wait for
+the next bytes. Invalid bytes, including incomplete characters at EOF or the
+retention limit, become `�`; `decoding_errors` flags the affected streams for
+that response. A literal valid `�` does not set the flag.
+
+For exact binary output, request `"encoding":"base64"`. The response then has
+`stdout_base64` and `stderr_base64` instead of the text fields, and omits
+`decoding_errors`. The same byte cursors and limits apply. File transfer tools
+continue to use base64.
+
+The host retrieves output over Firecracker's Unix-socket-to-vsock bridge to the
+supervisor on guest port 1024, then returns it through the authenticated HTTP/MCP
+API. Guest networking can remain off. Workspace credentials stay on the host.
+
+**Upgrade note:** this replaces the previous combined `data_base64` output and
+integer cursor. Update clients and regenerate optional adapter manifests. Rebuild
+the guest image, pin its new SHA-256 in the service config, and create new VMs.
+Existing guests and restored checkpoints keep their old supervisor; restarting
+the host service alone does not upgrade them.
 
 ## Suspension and failure semantics
 
@@ -215,7 +270,12 @@ sudo .venv/bin/python scripts/smoke.py --config /etc/microvm-mcp.toml --network
 ```
 
 The unit suite uses a fake backend that cannot execute code. The separate real
-smoke boots jailed VMs, compiles generated C, checks disk isolation, preserves a
+smoke boots jailed VMs, checks Fibonacci output, separate streams, UTF-8 pagination,
+binary output, and output limits, compiles generated C, checks disk isolation, preserves a
 running process across suspension, checks automatic hibernation, verifies network
 policy, and denies cross-workspace access. It deletes its VMs and revokes its
-credentials in cleanup. See `VALIDATION.md` for the measured local first-pass run.
+credentials in cleanup. See `VALIDATION.md` for measured results and known smoke failures.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

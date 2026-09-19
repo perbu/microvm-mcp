@@ -1,9 +1,38 @@
-# First-pass validation — 2026-09-18
+# Validation
+
+## UTF-8 output update — 2026-09-19
+
+- Ruff lint and format checks passed; pytest: **58 passed**, no skips, with the
+  same upstream Starlette/AnyIO deprecation warning noted below.
+- The locked dependencies checked successfully. Source distribution and wheel
+  builds passed; both include LICENSE, and the wheel declares Apache-2.0.
+- Rebuilt the Debian guest with the updated supervisor. Rootfs SHA-256:
+  `014aa7d13f1dbb4cb2700dae9fc6af9c95d48d433a5f098f20baaca6654a2b4b`.
+  Used the same Firecracker 1.17.0 and pinned kernel as below, on the host's
+  dedicated XFS volume.
+- The real KVM smoke passed **13 checks**, including Fibonacci with separate
+  stdout/stderr, nonzero exit status, UTF-8 pagination, invalid-byte replacement
+  flags, exact binary retrieval, and draining both pipes past the shared cap.
+  Boot took 1.830 s; restore took 0.131 s; process memory and output survived.
+- **The full smoke did not pass:** it stopped at the existing assertion that
+  guest wall time is within two seconds of host time after restore. This also
+  failed on the unchanged code and old image earlier on 2026-09-19. Later
+  cancellation, automatic hibernation, network-on, and revocation assertions
+  were not reached in this run. The clock failure remains unresolved.
+- A separate real-VM test through a temporary loopback HTTP server retrieved
+  all 20 Fibonacci values as readable stdout, a separate stderr marker, exit
+  code 0, and no timeout/truncation. An intentional error returned stderr and
+  exit code 7. The same Fibonacci check also passed over the MCP endpoint.
+- Test VMs were destroyed, temporary credentials revoked, and the temporary
+  HTTP server stopped. These results do not qualify deployment of the old
+  supervisor: rebuild/pin the image and recreate VMs when upgrading.
+
+## First-pass validation — 2026-09-18
 
 The service was tested on the actual Linux host outside the tool filesystem/device
 sandbox. No KVM-dependent checks were counted as passes without executing them.
 
-## Environment
+### Environment
 
 - Host: Linux 7.0.0-30-generic, x86_64, openable `/dev/kvm`, cgroup v2.
 - Firecracker and jailer: 1.17.0, installed in `/usr/local/bin` by the operator.
@@ -21,7 +50,7 @@ Artifact SHA-256 digests for this run:
 | Guest kernel | `e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2` |
 | Built rootfs | `ad672e003bdb285f8c76833ad06d232ac308aeb506534b897eb545370992da54` |
 
-## Portable checks
+### Portable checks
 
 - `ruff check src guest tests scripts examples`: passed.
 - `ruff format --check src guest tests scripts examples`: passed.
@@ -33,7 +62,7 @@ Artifact SHA-256 digests for this run:
 - Cross-workspace, expiration, revocation, rotation, retry conflicts, concurrent
   admission, busy suspension, uncertain outcomes and file traversal checks passed.
 
-## Real Firecracker/KVM smoke
+### Real Firecracker/KVM smoke
 
 `scripts/smoke.py --config <temporary-config> --network` passed all 16 assertions:
 
@@ -63,7 +92,7 @@ During development, the first run reproduced the upstream Firecracker 1.16 bare
 pause/resume vsock defect. Upgrading to 1.17 resolved it; the service now refuses
 older versions. See [upstream fix #6100](https://github.com/firecracker-microvm/firecracker/pull/6100).
 
-## Actual fast-agent adapter
+### Actual fast-agent adapter
 
 The generated manifest passed `fa-serve --check`. A temporary fa-serve instance
 then booted `examples/tool_probe_agent.py` in its real jailed process-pool path.
