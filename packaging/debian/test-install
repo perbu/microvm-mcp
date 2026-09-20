@@ -1,0 +1,72 @@
+#!/bin/sh
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends systemd /packages/*.deb
+
+test ! -e /usr/bin/python3
+microvm-mcp --help >/dev/null
+microvm-mcp-install-image --help >/dev/null
+env PYTHONHOME=/does-not-exist PYTHONPATH=/does-not-exist microvm-mcp --help >/dev/null
+test "$(/usr/lib/microvm-mcp/python/bin/python3.13 -I -B -c 'import platform; print(platform.python_version())')" = 3.13.15
+test "$(systemctl is-enabled microvm-mcp.service)" = disabled
+systemd-analyze verify /usr/lib/systemd/system/microvm-mcp.service
+echo '99ad0f5cd0514a88aad0e9ae8cfdb3cc3b4ab9d190e1194602406c786b5de7a5  /usr/lib/microvm-mcp/firecracker/1.17.0/firecracker' | sha256sum -c -
+echo '65ef226e96f0ceda55ba643f445801ef2cc0ea667ef67cad8ac4f406c9c8434f  /usr/lib/microvm-mcp/firecracker/1.17.0/jailer' | sha256sum -c -
+test -z "$(find /usr/lib/microvm-mcp -name __pycache__ -print -quit)"
+
+# Exercise the shipped stop guards without pretending this container has PID 1
+# systemd. Real checkpoint behavior is covered separately on a KVM host.
+mkdir -p /run/systemd/system /tmp/service-stubs /tmp/package-controls
+cat > /tmp/service-stubs/deb-systemd-invoke <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> /tmp/service-stops
+SH
+cat > /tmp/service-stubs/systemctl <<'SH'
+#!/bin/sh
+if [ "$1" = show ]; then
+    echo "${TEST_UNIT_STATE:-inactive}"
+fi
+SH
+chmod +x /tmp/service-stubs/*
+for package in /packages/*.deb; do
+    name=$(dpkg-deb -f "$package" Package)
+    dpkg-deb -e "$package" "/tmp/package-controls/$name"
+    env PATH="/tmp/service-stubs:$PATH" "/tmp/package-controls/$name/preinst" upgrade 0.0.0
+    if env PATH="/tmp/service-stubs:$PATH" TEST_UNIT_STATE=active \
+        "/tmp/package-controls/$name/preinst" upgrade 0.0.0; then
+        echo 'ERROR: runtime/application replacement allowed while still active' >&2
+        exit 1
+    fi
+done
+env PATH="/tmp/service-stubs:$PATH" /tmp/package-controls/microvm-mcp/prerm remove
+if env PATH="/tmp/service-stubs:$PATH" TEST_UNIT_STATE=active \
+    /tmp/package-controls/microvm-mcp/prerm remove; then
+    echo 'ERROR: removal allowed while still active' >&2
+    exit 1
+fi
+test "$(wc -l < /tmp/service-stops)" -eq 8
+rmdir /run/systemd/system
+
+microvm-mcp issue-token --state-dir /var/lib/microvm-mcp \
+    --workspace package-test --output /tmp/package-test.token --ttl 60
+test "$(stat -c %a /tmp/package-test.token)" = 600
+microvm-mcp revoke-workspace --state-dir /var/lib/microvm-mcp --workspace package-test
+printf '\n# local administrator edit\n' >> /etc/microvm-mcp.toml
+mkdir -p /var/lib/microvm-mcp/images/retained
+printf 'retained workspace data\n' > /var/lib/microvm-mcp/images/retained/marker
+sha256sum /etc/microvm-mcp.toml /var/lib/microvm-mcp/state.sqlite \
+    /var/lib/microvm-mcp/images/retained/marker > /tmp/retained.sha256
+
+# Reinstall exercises dpkg's upgrade maintainer-script path, including conffiles.
+dpkg -i /packages/*.deb
+sha256sum -c /tmp/retained.sha256
+test "$(systemctl is-enabled microvm-mcp.service)" = disabled
+microvm-mcp --help >/dev/null
+dpkg --remove microvm-mcp microvm-mcp-python microvm-mcp-firecracker-1.17
+sha256sum -c /tmp/retained.sha256
+dpkg --purge microvm-mcp microvm-mcp-python microvm-mcp-firecracker-1.17
+test ! -e /etc/microvm-mcp.toml
+test -s /var/lib/microvm-mcp/images/retained/marker
+test -s /var/lib/microvm-mcp/state.sqlite
+echo 'PASS: install, isolated CLI, disabled unit, reinstall, remove and purge preserve state'

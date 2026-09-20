@@ -1,0 +1,39 @@
+.TH MICROVM-MCP 1 "September 2026" "microvm-mcp" "Administrator Commands"
+.SH NAME
+microvm-mcp \- private development microVM service and administrator CLI
+.SH SYNOPSIS
+.B microvm-mcp serve --config
+.I FILE
+.br
+.B microvm-mcp issue-token --state-dir
+.I DIRECTORY
+.B --workspace
+.I NAME
+.B --output
+.I FILE
+.br
+.B microvm-mcp revoke-workspace --state-dir
+.I DIRECTORY
+.B --workspace
+.I NAME
+.br
+.B microvm-mcp demo-manifest --endpoint
+.I URL
+.SH DESCRIPTION
+Runs workspace-authorized Firecracker microVMs over HTTP and MCP.
+The serve command requires root, KVM, cgroup v2, pinned guest artifacts and
+reflink-capable storage. Configure the service before enabling its systemd unit.
+Use each subcommand's --help option for its complete arguments.
+.PP
+Workspace credentials are issued locally and written to mode-0600 files.
+Never place credentials in guest images, model prompts or tool arguments.
+Workspace revocation denies future requests but does not stop existing jobs.
+.SH FILES
+.I /etc/microvm-mcp.toml
+.br
+.I /var/lib/microvm-mcp
+.br
+.I /usr/share/doc/microvm-mcp/README.Debian
+.SH SEE ALSO
+.BR microvm-mcp-install-image (1),
+.BR systemctl (1)

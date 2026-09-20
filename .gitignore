@@ -5,3 +5,11 @@ __pycache__/
 *.egg-info/
 dist/
 .artifacts/
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.debhelper
+debian/*.substvars
+debian/microvm-mcp/
+debian/microvm-mcp-python/
+debian/microvm-mcp-firecracker-1.17/

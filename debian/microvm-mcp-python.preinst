@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+# APT can unpack this dependency before the application's preinst runs.
+# Checkpoint with the old interpreter before replacing any runtime files.
+if [ "$1" = upgrade ] && [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+    deb-systemd-invoke stop microvm-mcp.service
+    state=$(systemctl show --property=ActiveState --value microvm-mcp.service)
+    case "$state" in
+        inactive|failed) ;;
+        *) echo "microvm-mcp is still active; stop it before upgrading its runtime" >&2; exit 1 ;;
+    esac
+fi
+#DEBHELPER#

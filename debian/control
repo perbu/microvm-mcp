@@ -1,0 +1,34 @@
+Source: microvm-mcp
+Section: admin
+Priority: optional
+Maintainer: Per Buer <per.buer@gmail.com>
+Build-Depends: debhelper-compat (= 13), python3 (>= 3.11), ca-certificates
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+Homepage: https://github.com/perbu/microvm-mcp
+
+Package: microvm-mcp
+Architecture: amd64
+Depends: ${misc:Depends}, ${shlibs:Depends},
+ microvm-mcp-python (>= 3.13.15+pbs20260901-1), microvm-mcp-python (<< 3.14),
+ microvm-mcp-firecracker-1.17 (= 1.17.0-1),
+ iproute2, nftables, iptables, ca-certificates, init-system-helpers (>= 1.54)
+Description: private Linux development microVMs over MCP and HTTP
+ Workspace-authorized Firecracker service with a private, locked Python
+ dependency set. Requires KVM, cgroup v2, root, and reflink-capable storage.
+ The service remains stopped until explicitly configured and started.
+ Guest kernel and rootfs images are provisioned separately.
+
+Package: microvm-mcp-python
+Architecture: amd64
+Depends: ${misc:Depends}, ${shlibs:Depends}, ca-certificates, init-system-helpers (>= 1.54)
+Description: private CPython runtime for microvm-mcp
+ Pinned python-build-standalone runtime used only by microvm-mcp.
+ This package does not replace the system Python interpreter.
+
+Package: microvm-mcp-firecracker-1.17
+Architecture: amd64
+Depends: ${misc:Depends}, init-system-helpers (>= 1.54)
+Description: pinned Firecracker and jailer for microvm-mcp
+ Matching Firecracker and jailer 1.17.0 binaries, kept byte-for-byte intact
+ for checkpoint compatibility. Includes upstream third-party notices.

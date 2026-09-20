@@ -37,7 +37,52 @@ the existing `host_fetch` transport; no harness or demo code changes are require
   execution is not replayed automatically. `vm_status.jobs` exposes known handles
   for reconciliation; the history is capped at 4096 requests per workspace.
 
+## Debian packages
+
+The project builds three packages for **Debian 13 (trixie), amd64**:
+
+| Package | Contents |
+| --- | --- |
+| `microvm-mcp` | Service, locked Python dependencies, administrator CLI, image installer, configuration and systemd unit |
+| `microvm-mcp-python` | Private CPython 3.13.15 runtime; leaves the system Python unchanged |
+| `microvm-mcp-firecracker-1.17` | Pinned Firecracker and jailer 1.17.0 binaries |
+
+Build from the repository root on an amd64 machine with Docker and network access:
+
+```sh
+scripts/build-debs
+# Optional: choose another output directory.
+scripts/build-debs /absolute/path/to/packages
+```
+
+The default output directory is `dist/debian/`, containing the three `.deb` files,
+`.changes`, `.buildinfo` and `SHA256SUMS`. The builder verifies pinned upstream
+archives and dependency hashes, then runs Ruff, pytest and Debian packaging in
+a container with networking disabled. Lintian checks the resulting packages.
+Building does not install packages on the host. To test installation, reinstall,
+removal and state retention in a disposable Debian container:
+
+```sh
+scripts/test-debs
+```
+
+Copy the three packages to the server and install them with APT:
+
+```sh
+sudo apt install ./microvm-mcp_*.deb ./microvm-mcp-python_*.deb \
+  ./microvm-mcp-firecracker-1.17_*.deb
+```
+
+Installation requires no Python downloads or compilation; APT may fetch ordinary
+system dependencies. The service remains disabled and stopped until configured.
+Provision KVM, cgroup v2, reflink-capable storage and a separately built guest
+kernel/rootfs, then edit `/etc/microvm-mcp.toml` before enabling the service.
+See the [Debian packaging guide](packaging/debian/README.md) for image installation,
+startup, upgrade behavior, runtime maintenance and validation details.
+
 ## Host setup
+
+For installation directly from source, follow the setup below.
 
 The validated target is Linux x86_64 with real `/dev/kvm`, cgroup v2, matching
 **Firecracker and jailer 1.17.0**, Python 3.11+, `ip`, `nft`, and `iptables`.

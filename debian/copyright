@@ -1,0 +1,27 @@
+microvm-mcp
+Source: https://github.com/perbu/microvm-mcp
+Copyright: 2026 Per Buer and microvm-mcp contributors
+
+The application and Debian packaging are licensed under Apache-2.0.
+The full application license is installed as LICENSE in this directory.
+On Debian systems Apache-2.0 is also in /usr/share/common-licenses/Apache-2.0.
+
+These vendor packages contain separately licensed upstream components:
+
+microvm-mcp:
+  Python dependencies retain their original *.dist-info metadata, license
+  files and notices under /usr/lib/microvm-mcp/dependencies/. The installed
+  requirements.txt and uv.lock identify the versions and artifact hashes.
+
+microvm-mcp-python:
+  CPython's license is retained in python/lib/python3.13/LICENSE.txt under
+  /usr/lib/microvm-mcp/. Additional python-build-standalone component licenses
+  and copyright notices are in /usr/share/doc/microvm-mcp-python/licenses/.
+  These component licenses are not replaced by the application's license.
+
+microvm-mcp-firecracker-1.17:
+  Upstream LICENSE, NOTICE and THIRD-PARTY are installed under
+  /usr/share/doc/microvm-mcp-firecracker-1.17/upstream/.
+
+The artifact URLs and SHA-256 pins are recorded in artifacts.json in each
+package's documentation directory. Build tooling (including uv) is not shipped.

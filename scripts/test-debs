@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Package installation checks only; this container deliberately receives no KVM.
+set -euo pipefail
+root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+packages=$(realpath "${1:-$root/dist/debian}")
+docker run --rm \
+    --mount "type=bind,src=$packages,dst=/packages,readonly" \
+    --mount "type=bind,src=$root/packaging/debian/test-install,dst=/test-install,readonly" \
+    debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a \
+    sh /test-install

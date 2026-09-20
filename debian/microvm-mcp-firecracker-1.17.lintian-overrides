@@ -1,0 +1,6 @@
+# Checkpoint compatibility requires these exact upstream binary hashes.
+microvm-mcp-firecracker-1.17: unstripped-binary-or-object [usr/lib/microvm-mcp/firecracker/1.17.0/firecracker]
+microvm-mcp-firecracker-1.17: unstripped-binary-or-object [usr/lib/microvm-mcp/firecracker/1.17.0/jailer]
+# Upstream static PIE executables have no shared-library prerequisites.
+microvm-mcp-firecracker-1.17: shared-library-lacks-prerequisites [usr/lib/microvm-mcp/firecracker/1.17.0/firecracker]
+microvm-mcp-firecracker-1.17: shared-library-lacks-prerequisites [usr/lib/microvm-mcp/firecracker/1.17.0/jailer]

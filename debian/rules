@@ -1,0 +1,40 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	python3 scripts/debian.py verify
+
+override_dh_auto_build:
+
+override_dh_auto_test:
+	python3 scripts/debian.py check
+
+override_dh_auto_install:
+	python3 scripts/debian.py stage
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start --no-stop-on-upgrade
+
+# These are private upstream binaries. In particular, stripping Firecracker
+# would change the digest recorded in every checkpoint.
+override_dh_strip:
+
+override_dh_dwz:
+
+override_dh_makeshlibs:
+
+override_dh_shlibdeps:
+	# libpython3.so is an ABI forwarding stub whose only dependency contains
+	# literal $$ORIGIN. dpkg-shlibdeps cannot resolve that DT_NEEDED spelling;
+	# its target libpython3.13.so.1.0 is scanned normally alongside the binary.
+	dh_shlibdeps -X/libpython3.so -l$(CURDIR)/debian/microvm-mcp-python/usr/lib/microvm-mcp/python/lib
+
+override_dh_gencontrol:
+	dh_gencontrol -pmicrovm-mcp
+	dh_gencontrol -pmicrovm-mcp-python -- -v$$(python3 scripts/debian.py version python)
+	dh_gencontrol -pmicrovm-mcp-firecracker-1.17 -- -v$$(python3 scripts/debian.py version firecracker)
+
+override_dh_auto_clean:
+	# Prepared inputs live outside debian/ and are reusable after dh_clean.

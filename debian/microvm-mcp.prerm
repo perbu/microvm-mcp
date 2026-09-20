@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+case "$1" in
+    remove|deconfigure)
+        if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+            deb-systemd-invoke stop microvm-mcp.service
+            state=$(systemctl show --property=ActiveState --value microvm-mcp.service)
+            case "$state" in
+                inactive|failed) ;;
+                *) echo "microvm-mcp is still active; stop it before removal" >&2; exit 1 ;;
+            esac
+        fi
+        ;;
+esac
+#DEBHELPER#

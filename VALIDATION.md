@@ -1,5 +1,60 @@
 # Validation
 
+## Debian vendor packaging — 2026-09-20
+
+- Built three amd64 packages in a digest-pinned Debian 13 container: service
+  `0.1.0-1`, private CPython `3.13.15+pbs20260901-1`, and Firecracker/jailer
+  `1.17.0-1`. Online preparation verifies pinned archives and locked wheel hashes;
+  the subsequent `dpkg-buildpackage` container has networking disabled.
+- Ruff lint/format and **86 unit tests passed**, no skips, both with the packaged
+  Python 3.13.15/dependencies in Debian and the existing development Python 3.14
+  environment. The upstream Starlette/AnyIO deprecation warning remains.
+  A sandboxed host rerun stalled in transport tests and was terminated; the
+  diagnostic rerun outside that sandbox passed all 86 tests in 0.43 seconds.
+- `scripts/test-debs` passed in a fresh Debian 13 container with no system
+  `/usr/bin/python3`: installation, both CLI help commands, ignored Python
+  environment overrides, token issuance/revocation, disabled initial systemd
+  unit, unit syntax, and exact packaged Firecracker/jailer binary hashes.
+  Reinstall exercised dpkg's upgrade path; configuration and state survived
+  reinstall/removal, and state survived purge. Maintainer-script stop guards
+  were also tested with simulated inactive/active systemd responses: upgrading
+  any component or removing the application refuses to continue while active.
+  The container does not run systemd as PID 1; these checks alone do not prove
+  checkpoint behavior.
+- The packaged image installer copied the previously validated rootfs/kernel
+  to a fresh private directory on the host's XFS volume, verified their digests
+  and a real reflink into the state directory, and published the bundle.
+- **All 28 real Firecracker/KVM smoke checks passed** using the extracted Debian
+  application, private Python and wheels, unmodified packaged Firecracker/jailer,
+  networking enabled, and 30-second suspension probes. Three-second managed
+  jobs survived pause, hibernate and pause-to-hibernate. Measured wall-clock
+  skew intervals stayed within 2.7 ms of zero. Boot was 1.874 s and restore
+  0.836 s in this run; these are local measurements, not performance guarantees.
+- A temporary host systemd unit using the packaged unit's settings (only its
+  executable and configuration paths redirected into the test installation)
+  checkpointed two VMs, one with a running job and one with a paused job.
+  After stop/start both VMs were hibernated and both jobs resumed and completed
+  with the expected output and no managed timeout. An initial test harness
+  attempt used the wrong create-response key; correcting it to `id` allowed the
+  systemd check to complete without application changes.
+- All six validation VMs were destroyed, their cgroups removed, the temporary
+  systemd unit unloaded, and the isolated test state and credentials deleted.
+
+The real-KVM/systemd host was Ubuntu 26.04 with cgroup v2 and XFS. Debian 13
+installation and package lifecycle were checked in containers; a fully booted
+Debian 13 KVM server was not exercised. Guest code was unchanged, so this used
+the 2026-09-19 image digest `50b13f41721ab7455c1006aeb1168ae3751f80f8b99f58c02b52485d17ab7df3`
+and kernel digest `e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2`.
+
+Lintian reports no unoverridden errors. Scoped overrides document deliberate
+bundling, preserved upstream ELF symbols and static-PIE/library classification.
+Remaining warnings are the upstream Python executable's missing PIE hardening
+and the initial vendor upload not closing Debian bugs. These packages do not
+claim Debian archive acceptance or a bit-reproducible complete build.
+
+Build and installation commands are in `packaging/debian/README.md`. No APT
+repository was published and no packages were installed into the host system.
+
 ## Restore-clock investigation and fix — 2026-09-19
 
 The old failure was real clock loss, not just a tight assertion. A temporary

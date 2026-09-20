@@ -1,0 +1,10 @@
+# Deliberate private standalone runtime: embedded libraries are updated through
+# microvm-mcp-python releases. Upstream ELF files remain byte-for-byte intact.
+microvm-mcp-python: embedded-library * [usr/lib/microvm-mcp/python/bin/python3.13]
+microvm-mcp-python: embedded-library * [usr/lib/microvm-mcp/python/lib/libpython3.13.so.1.0]
+microvm-mcp-python: unstripped-binary-or-object [usr/lib/microvm-mcp/python/bin/python3.13]
+microvm-mcp-python: unstripped-binary-or-object [usr/lib/microvm-mcp/python/lib/libpython3.13.so.1.0]
+microvm-mcp-python: unstripped-binary-or-object [usr/lib/microvm-mcp/python/lib/libpython3.so]
+microvm-mcp-python: unstripped-binary-or-object [usr/lib/microvm-mcp/python/lib/python3.13/lib-dynload/_dbm.cpython-313-x86_64-linux-gnu.so]
+# This is a non-executable stdlib module imported by the private interpreter.
+microvm-mcp-python: unusual-interpreter python [usr/lib/microvm-mcp/python/lib/python3.13/encodings/rot_13.py]

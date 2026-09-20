@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Build vendor binary packages in Debian 13. Docker never receives host devices.
+set -euo pipefail
+root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+output=${1:-"$root/dist/debian"}
+mkdir -p "$output"
+output=$(realpath "$output")
+docker build -t microvm-mcp-deb-builder "$root/packaging/debian"
+stage=$(mktemp -d "$output/.build.XXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+# Work as the invoking user, so artifacts remain removable without root.
+# Only the output directory is writable; the source tree is mounted read-only.
+docker run --rm --user "$(id -u):$(id -g)" \
+    --mount "type=bind,src=$root,dst=/source,readonly" \
+    --mount "type=bind,src=$stage,dst=/build" \
+    microvm-mcp-deb-builder sh -eu -c '
+    export UV_CACHE_DIR=/tmp/uv-cache
+    mkdir -p /build/source
+    cd /source
+    tar --exclude=__pycache__ --exclude=.pytest_cache --exclude=.ruff_cache \
+        -cf - README.md LICENSE pyproject.toml uv.lock src guest tests scripts examples \
+        packaging debian | tar -xf - -C /build/source
+    cd /build/source
+    python3 scripts/debian.py prepare
+    '
+# Prove the Debian build and tests need no network once inputs are prepared.
+docker run --rm --network none --user "$(id -u):$(id -g)" \
+    --mount "type=bind,src=$stage,dst=/build" \
+    --mount "type=bind,src=$output,dst=/output" \
+    microvm-mcp-deb-builder sh -eu -c '
+    cd /build/source
+    dpkg-buildpackage -b -us -uc
+    lintian --fail-on error /build/*.changes
+    cp /build/*.deb /build/*.changes /build/*.buildinfo /output/
+    cd /output
+    sha256sum ./*.deb > SHA256SUMS
+    '

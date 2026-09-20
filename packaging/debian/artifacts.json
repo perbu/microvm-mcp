@@ -1,0 +1,22 @@
+{
+  "python": {
+    "version": "3.13.15+pbs20260901-1",
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.13.15%2B20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+    "sha256": "8a689a077337bea6d1c4bc0b7df1d52fcaa28f5f67e50df8bf417c1e3f9d8874"
+  },
+  "python-notices": {
+    "url": "https://github.com/astral-sh/python-build-standalone/archive/4bb01f09aaf362c71e891be4a41cb6d6ddf830b3.tar.gz",
+    "sha256": "6f1a6b630d82cbd2fd49d7aab5636ec352f9b515f23bda74004e8fd3a33ac0b4"
+  },
+  "firecracker": {
+    "version": "1.17.0-1",
+    "url": "https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-x86_64.tgz",
+    "sha256": "06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558",
+    "firecracker_sha256": "99ad0f5cd0514a88aad0e9ae8cfdb3cc3b4ab9d190e1194602406c786b5de7a5",
+    "jailer_sha256": "65ef226e96f0ceda55ba643f445801ef2cc0ea667ef67cad8ac4f406c9c8434f"
+  },
+  "uv": {
+    "url": "https://github.com/astral-sh/uv/releases/download/0.9.4/uv-x86_64-unknown-linux-gnu.tar.gz",
+    "sha256": "e02f7fc102d6a1ebfa3b260b788e9adf35802be28c8d85640e83246e61519c1e"
+  }
+}

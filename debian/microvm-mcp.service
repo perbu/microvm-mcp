@@ -1,0 +1,26 @@
+[Unit]
+Description=Private development microVM service
+Documentation=https://github.com/perbu/microvm-mcp
+After=network.target
+ConditionPathExists=/etc/microvm-mcp.toml
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/microvm-mcp serve --config /etc/microvm-mcp.toml
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+# Signal only the controller first: it checkpoints guests before stopping VMMs.
+# Size this timeout for all configured VMs and the host's storage throughput.
+KillMode=mixed
+TimeoutStopSec=15min
+Restart=no
+# Jailer manages /sys/fs/cgroup/microvm-mcp outside this unit. Do not add
+# ProtectControlGroups, PrivateDevices, PrivateNetwork or mount namespaces
+# without real-KVM tests of jailer and network namespace mount propagation.
+
+[Install]
+WantedBy=multi-user.target
