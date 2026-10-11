@@ -1,0 +1,34 @@
+# Node-local, reflink-capable state volume. Checkpoints restore only on the same
+# host with the same Firecracker binary, so the pod must never move nodes.
+# Create one PersistentVolume per KVM node that runs an instance.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: microvm-local
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: microvm-mcp-kvm-node-1
+spec:
+  capacity:
+    storage: 500Gi  # REPLACE: real capacity of the XFS/Btrfs volume
+  volumeMode: Filesystem
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: microvm-local
+  local:
+    # REPLACE: mount point of a dedicated XFS (reflink=1) or Btrfs filesystem.
+    # Must not be mounted noexec or nodev: jailer copies Firecracker and creates
+    # device nodes below jails/. Images and state must share this filesystem.
+    path: /srv/microvm-mcp
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [kvm-node-1]  # REPLACE: node name

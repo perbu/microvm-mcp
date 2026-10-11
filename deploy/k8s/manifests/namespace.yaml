@@ -1,0 +1,9 @@
+# The service pod is privileged (jailer, KVM, network namespaces). Keep it in a
+# namespace of its own so the privileged Pod Security level applies nowhere else.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: microvm-mcp
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: privileged

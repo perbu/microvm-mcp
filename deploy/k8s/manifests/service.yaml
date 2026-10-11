@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: microvm-mcp
+  namespace: microvm-mcp
+spec:
+  # ClusterIP for an in-cluster broker. For clients outside the cluster, use
+  # type LoadBalancer (MetalLB) or an ingress with TLS passthrough or an HTTPS
+  # backend, and add the external name to allowed_hosts.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: microvm-mcp
+  ports:
+    - name: https
+      port: 443
+      targetPort: https

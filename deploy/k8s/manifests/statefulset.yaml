@@ -1,0 +1,144 @@
+# One instance per KVM node. Never run two pods against one state volume: the
+# SQLite store, VM slots and jail UID range belong to a single service process.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: microvm-mcp
+  namespace: microvm-mcp
+spec:
+  serviceName: microvm-mcp
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: microvm-mcp
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: microvm-mcp
+    spec:
+      # Nothing here talks to the Kubernetes API. Keep cluster credentials out
+      # of a privileged pod that runs guest workloads.
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # On SIGTERM the service checkpoints every running VM before exiting.
+      # Size this for max_vms and the volume's write throughput.
+      terminationGracePeriodSeconds: 900
+      nodeSelector:
+        microvm-mcp/kvm: "true"
+      tolerations:
+        - key: microvm-mcp/dedicated
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: microvm-mcp
+          image: registry.example.com/microvm-mcp:0.1.0-1  # REPLACE
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MICROVM_IP_FORWARD
+              value: "1"
+            # "1" starts the pod without the service, for image installation,
+            # smoke tests and inspection through kubectl exec.
+            - name: MICROVM_MAINTENANCE
+              value: "0"
+          securityContext:
+            # Jailer needs mknod, chroot, setuid, mount and network namespaces,
+            # and /dev/kvm plus /dev/net/tun through the device cgroup.
+            privileged: true
+          resources:
+            requests:
+              cpu: "4"
+              memory: 24Gi
+            limits:
+              # VM memory is charged to this container. No CPU limit: it would
+              # throttle all VMs together; each VM already has its own cpu.max.
+              memory: 24Gi
+          # Readiness only. A liveness restart would kill every running VM
+          # instead of checkpointing it.
+          readinessProbe:
+            exec:
+              command:
+                - /usr/lib/microvm-mcp/python/bin/python3.13
+                - -I
+                - -B
+                - -c
+                - import socket; socket.create_connection(("127.0.0.1", 8090), 2).close()
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/microvm-mcp
+            - name: config
+              mountPath: /etc/microvm-mcp
+              readOnly: true
+        - name: tls-proxy
+          image: caddy:2.8.4  # Pin by digest in production.
+          args: [caddy, run, --config, /etc/caddy/Caddyfile, --adapter, caddyfile]
+          ports:
+            - name: https
+              containerPort: 8443
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              # The official image's binary carries this file capability; exec
+              # fails with EPERM if it is outside the bounding set.
+              add: [NET_BIND_SERVICE]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 10
+          volumeMounts:
+            - name: caddy
+              mountPath: /etc/caddy
+              readOnly: true
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            - name: caddy-data
+              mountPath: /data
+            - name: caddy-config
+              mountPath: /config
+      volumes:
+        - name: config
+          configMap:
+            name: microvm-mcp
+            items:
+              - key: service.toml
+                path: service.toml
+        - name: caddy
+          configMap:
+            name: microvm-mcp
+            items:
+              - key: Caddyfile
+                path: Caddyfile
+        - name: tls
+          secret:
+            secretName: microvm-mcp-tls
+        - name: caddy-data
+          emptyDir: {}
+        - name: caddy-config
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        storageClassName: microvm-local
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 500Gi  # REPLACE: match the PersistentVolume

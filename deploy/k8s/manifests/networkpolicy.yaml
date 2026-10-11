@@ -1,0 +1,41 @@
+# Guest traffic leaves the pod masqueraded to the pod IP, so the CNI's egress
+# enforcement applies to it in addition to the service's per-VM nftables rules.
+# Requires a CNI that enforces NetworkPolicy (Calico, Cilium, ...).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: microvm-mcp
+  namespace: microvm-mcp
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: microvm-mcp
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # REPLACE: only the trusted broker/clients or the ingress controller.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: microvm-clients
+      ports:
+        - port: 8443
+          protocol: TCP
+  egress:
+    # Public IPv4 only. The service itself needs no egress; the guests resolve
+    # through 1.1.1.1, which this rule permits. No IPv6 rule: guests have none.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.0.0.0/24
+              - 192.168.0.0/16
+              - 198.18.0.0/15
+              - 224.0.0.0/4
+              - 240.0.0.0/4
+              # REPLACE: add public node/management/pod/service CIDRs here too.

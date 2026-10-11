@@ -80,6 +80,13 @@ kernel/rootfs, then edit `/etc/microvm-mcp.toml` before enabling the service.
 See the [Debian packaging guide](packaging/debian/README.md) for image installation,
 startup, upgrade behavior, runtime maintenance and validation details.
 
+## Kubernetes
+
+`deploy/k8s/` builds a container image from these packages and runs it as a
+privileged, node-pinned StatefulSet with local storage and a TLS sidecar. The
+host requirements below still apply to the node. See the
+[Kubernetes deployment guide](deploy/k8s/README.md).
+
 ## Host setup
 
 For installation directly from source, follow the setup below.

@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: microvm-mcp
+  namespace: microvm-mcp
+data:
+  # Read once at startup; restart the pod after changing it.
+  service.toml: |
+    state_dir = "/var/lib/microvm-mcp"
+    firecracker = "/usr/lib/microvm-mcp/firecracker/1.17.0/firecracker"
+    jailer = "/usr/lib/microvm-mcp/firecracker/1.17.0/jailer"
+    # Paths printed by microvm-mcp-install-image; images live on the state volume
+    # because reflinks cannot cross filesystems.
+    kernel = "/var/lib/microvm-mcp/images/debian-13-dev-v1/vmlinux"
+    rootfs = "/var/lib/microvm-mcp/images/debian-13-dev-v1/rootfs.ext4"
+    image_id = "debian-13-dev-v1"
+    rootfs_sha256 = "REPLACE_WITH_BUILT_IMAGE_SHA256"
+    kernel_sha256 = "REPLACE_WITH_PINNED_KERNEL_SHA256"
+    # Without user namespaces these are node UIDs: keep the range unused on the
+    # node itself. Preflight can only check the container's /etc/passwd.
+    uid_base = 62000
+    # Keep the pod's memory request/limit >= max_memory_mib + 256 MiB per VM
+    # plus the service and page cache.
+    max_vms = 16
+    max_memory_mib = 16384
+    max_storage_gib = 64
+    port = 8090
+    # The pod's own interface. IPv4 forwarding is enabled in the pod's network
+    # namespace by the entrypoint (MICROVM_IP_FORWARD=1).
+    uplink = "eth0"
+    # REPLACE: node, BMC/management, pod and service CIDRs that are not already
+    # covered by the built-in private/CGNAT/link-local block list.
+    blocked_cidrs = []
+    # Host headers that reach the loopback listener through the TLS proxy.
+    allowed_hosts = [
+      "microvm-mcp.microvm-mcp.svc",
+      "microvm-mcp.microvm-mcp.svc.cluster.local",
+      "vms.example.com",  # REPLACE or remove: external name, if exposed
+    ]
+  # The service listens on 127.0.0.1 only; this sidecar is the pod's only
+  # listener. It preserves the client's Host header for the allowlist above.
+  Caddyfile: |
+    {
+    	admin off
+    	auto_https off
+    	persist_config off
+    }
+
+    :8443 {
+    	tls /tls/tls.crt /tls/tls.key
+    	reverse_proxy 127.0.0.1:8090
+    }
