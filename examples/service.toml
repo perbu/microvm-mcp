@@ -1,11 +1,6 @@
 state_dir = "/var/lib/microvm-mcp"
 firecracker = "/opt/microvm-mcp/firecracker"
 jailer = "/opt/microvm-mcp/jailer"
-kernel = "/opt/microvm-mcp/vmlinux"
-rootfs = "/var/lib/microvm-images/debian-13.ext4"
-image_id = "debian-13-dev-v1"
-rootfs_sha256 = "REPLACE_WITH_BUILT_IMAGE_SHA256"
-kernel_sha256 = "REPLACE_WITH_PINNED_KERNEL_SHA256"
 uid_base = 62000
 max_vms = 16
 max_memory_mib = 16384
@@ -14,3 +9,23 @@ port = 8090
 # uplink = "eth0"  # required only for network=on; IPv4 forwarding must already be enabled
 # blocked_cidrs = ["YOUR_PUBLIC_MANAGEMENT_SUBNET/24"]
 # allowed_hosts = ["127.0.0.1:8090", "vms.example.com"]  # TLS reverse proxy Host header
+# Guest vsock streams (defaults shown). Port 1024, the guest supervisor, is refused.
+# stream_ports = [[1025, 65535]]
+# max_streams = 32
+# max_streams_per_workspace = 8
+# max_streams_per_vm = 4
+# stream_rate_bytes = 33554432  # per direction per stream; 0 is unlimited
+
+# One table per bootable image; microvm-mcp-install-image prints it. rootfs and
+# kernel default to <state_dir>/images/<id>/rootfs.ext4 and vmlinux.
+[images.debian-13-dev-v1]
+rootfs = "/var/lib/microvm-images/debian-13.ext4"
+kernel = "/opt/microvm-mcp/vmlinux"
+rootfs_sha256 = "REPLACE_WITH_BUILT_IMAGE_SHA256"
+kernel_sha256 = "REPLACE_WITH_PINNED_KERNEL_SHA256"
+default = true
+
+# [images.re-analysis-v1]
+# rootfs_sha256 = "..."
+# kernel_sha256 = "..."
+# min_memory_mib = 4096

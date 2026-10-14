@@ -1,6 +1,9 @@
+import asyncio
 import contextvars
 import json
 import logging
+import re
+import socket
 import threading
 from contextlib import asynccontextmanager
 
@@ -8,48 +11,75 @@ import anyio
 import mcp.types as types
 from mcp.server import Server
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket
 
-from .catalog import TOOLS
 from .errors import ServiceError
+from .streams import CHUNK, Rate
 
 TOKEN = contextvars.ContextVar("workspace_credential")
 LOG = logging.getLogger(__name__)
 MAX_BODY = 256 * 1024
+# Client frames above this close the stream; the attach client sends CHUNK-sized frames.
+MAX_FRAME = 16 * CHUNK
+VM_ID = re.compile(r"[a-f0-9]{32}")
+RECHECK_SECONDS = 5
+
+
+async def deny(websocket, response):
+    # Prefer a real HTTP status and JSON error; otherwise a policy-violation close.
+    if "websocket.http.response" in websocket.scope.get("extensions", {}):
+        await websocket.send_denial_response(response)
+    else:
+        await websocket.close(1008)
 
 
 class AccessBoundary:
-    """Authenticate every HTTP request, before MCP dispatch or HTTP tool routing."""
+    """Authenticate every HTTP and WebSocket request before any routing."""
 
     def __init__(self, app, service, allowed_hosts):
         self.app, self.service = app, service
         self.allowed_hosts = set(allowed_hosts)
 
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            return await self.app(scope, receive, send)
-        request = Request(scope, receive)
-        if request.headers.get("host") not in self.allowed_hosts:
-            return await JSONResponse({"error": "unrecognized host"}, 403)(scope, receive, send)
+    def check(self, headers):
+        """Return (token, None) or (None, denial response)."""
+        if headers.get("host") not in self.allowed_hosts:
+            return None, JSONResponse({"error": "unrecognized host"}, 403)
         # This is an agent API, not a browser application. No ambient cookie authority.
-        if "origin" in request.headers:
-            return await JSONResponse({"error": "browser requests disabled"}, 403)(
-                scope, receive, send
-            )
-        auth = request.headers.getlist("authorization")
+        if "origin" in headers:
+            return None, JSONResponse({"error": "browser requests disabled"}, 403)
+        auth = headers.getlist("authorization")
         if len(auth) != 1 or not auth[0].startswith("Bearer "):
-            return await JSONResponse(
+            return None, JSONResponse(
                 {"error": "credential required"}, 401, headers={"WWW-Authenticate": "Bearer"}
-            )(scope, receive, send)
+            )
         token = auth[0][7:]
         try:
             self.service.store.authenticate(token)
         except ServiceError:
-            return await JSONResponse(
+            return None, JSONResponse(
                 {"error": "invalid credential"}, 401, headers={"WWW-Authenticate": "Bearer"}
-            )(scope, receive, send)
+            )
+        return token, None
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        token, denial = self.check(Headers(scope=scope))
+        if scope["type"] == "websocket":
+            if denial is not None:
+                return await deny(WebSocket(scope, receive, send), denial)
+            reset = TOKEN.set(token)
+            try:
+                return await self.app(scope, receive, send)
+            finally:
+                TOKEN.reset(reset)
+        if denial is not None:
+            return await denial(scope, receive, send)
+        request = Request(scope, receive)
         # Bound bodies for both transports, including chunked HTTP. Do not accumulate
         # arbitrary bodies inside Starlette/JSON decoding or before authentication.
         body = bytearray()
@@ -92,7 +122,7 @@ def create_app(service, allowed_hosts):
             ) from None
 
     async def list_tools(ctx, params):
-        return types.ListToolsResult(tools=[types.Tool(**tool) for tool in TOOLS])
+        return types.ListToolsResult(tools=[types.Tool(**tool) for tool in service.tools])
 
     async def call_tool(ctx, params):
         try:
@@ -115,6 +145,109 @@ def create_app(service, allowed_hosts):
             return JSONResponse(await dispatch(request.path_params["name"], args))
         except ServiceError as exc:
             return JSONResponse(exc.body(), exc.status)
+
+    async def pump(websocket, stream, token):
+        """Copy bytes both ways until the guest closes its end (close code 1000).
+
+        A client's empty binary frame is EOF for the guest. Firecracker's vsock bridge
+        has no half-close: the guest reads the remaining data and EOF, then the
+        connection is closed in both directions.
+        """
+        sock = stream.sock
+        sock.setblocking(False)
+        loop = asyncio.get_running_loop()
+        outcome = []
+        client_eof = False
+
+        async with anyio.create_task_group() as group:
+
+            def finish(code, reason=""):
+                if not outcome:
+                    outcome.append((code, reason))
+                group.cancel_scope.cancel()
+
+            async def from_guest():
+                rate = Rate(service.stream_rate_bytes)
+                try:
+                    while data := await loop.sock_recv(sock, CHUNK):
+                        await rate.take(len(data))
+                        stream.from_guest += len(data)
+                        await websocket.send_bytes(data)
+                except OSError:
+                    pass
+                except Exception:
+                    return finish(None)  # Client is gone; nothing to close.
+                if stream.reason is not None:
+                    return finish(1001, stream.reason)
+                finish(1000)
+
+            async def from_client():
+                nonlocal client_eof
+                rate = Rate(service.stream_rate_bytes)
+                while True:
+                    message = await websocket.receive()
+                    if message["type"] == "websocket.disconnect":
+                        return finish(None)
+                    data = message.get("bytes")
+                    if data is None:
+                        data = (message.get("text") or "").encode()
+                    if client_eof:
+                        return finish(1002, "data after EOF")
+                    try:
+                        if not data:
+                            sock.shutdown(socket.SHUT_WR)
+                            client_eof = True
+                            continue
+                        await rate.take(len(data))
+                        await loop.sock_sendall(sock, data)
+                    except OSError:
+                        return finish(1001, stream.reason or "guest connection closed")
+                    stream.to_guest += len(data)
+
+            async def watchdog():
+                # Revocation or expiry ends open streams too, not only new requests.
+                while True:
+                    await anyio.sleep(RECHECK_SECONDS)
+                    if stream.reason is not None:
+                        return finish(1001, stream.reason)
+                    try:
+                        await anyio.to_thread.run_sync(service.store.authenticate, token)
+                    except ServiceError:
+                        stream.close("credential invalid")
+                        return finish(1008, "credential invalid")
+
+            group.start_soon(from_guest)
+            group.start_soon(from_client)
+            group.start_soon(watchdog)
+        return outcome[0] if outcome else (1011, "stream error")
+
+    async def stream_endpoint(websocket):
+        vm_id, port = websocket.path_params["vm_id"], websocket.path_params["port"]
+        token = TOKEN.get()
+        try:
+            if not VM_ID.fullmatch(vm_id):
+                raise ServiceError("not_found", "VM not found", 404)
+            # Shielded: a registered stream must reach close_stream below.
+            with anyio.CancelScope(shield=True):
+                stream = await anyio.to_thread.run_sync(service.open_stream, token, vm_id, port)
+        except ServiceError as exc:
+            return await deny(websocket, JSONResponse(exc.body(), exc.status))
+        except Exception:
+            LOG.exception("stream open failed")
+            error = ServiceError("backend_failure", "Stream failed; inspect VM status", 502)
+            return await deny(websocket, JSONResponse(error.body(), error.status))
+        code, reason = 1011, "stream error"
+        try:
+            await websocket.accept()
+            code, reason = await pump(websocket, stream, token)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await anyio.to_thread.run_sync(service.close_stream, stream, reason or "closed")
+        if code is not None:
+            try:
+                await websocket.close(code, reason)
+            except Exception:
+                pass
 
     @asynccontextmanager
     async def lifespan(server):
@@ -141,6 +274,9 @@ def create_app(service, allowed_hosts):
         transport_security=TransportSecuritySettings(
             allowed_hosts=allowed_hosts, allowed_origins=[]
         ),
-        custom_starlette_routes=[Route("/v1/tools/{name}", http_tool, methods=["POST"])],
+        custom_starlette_routes=[
+            Route("/v1/tools/{name}", http_tool, methods=["POST"]),
+            WebSocketRoute("/v1/vms/{vm_id}/streams/{port:int}", stream_endpoint),
+        ],
     )
     return AccessBoundary(app, service, allowed_hosts)

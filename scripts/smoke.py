@@ -2,21 +2,120 @@
 """Enforcing real-KVM lifecycle smoke. Missing prerequisites are failures, never passes."""
 
 import argparse
+import asyncio
 import base64
 import fcntl
+import hashlib
+import io
 import json
 import os
+import socket
 import subprocess
+import sys
+import tempfile
+import threading
 import time
 import tomllib
 import uuid
 from pathlib import Path
 
+import uvicorn
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+from websockets.exceptions import InvalidStatus
+from websockets.sync.client import connect
+
+from microvm_mcp.attach import attach, stream_url
+from microvm_mcp.cli import stream_settings
 from microvm_mcp.errors import ServiceError
 from microvm_mcp.firecracker import Firecracker
 from microvm_mcp.network import names
+from microvm_mcp.server import MAX_FRAME, create_app
 from microvm_mcp.service import Service
 from microvm_mcp.store import Store
+
+# Guest-side test fixtures. They run only inside the microVM, started through vm_exec.
+VSOCK_SERVE = b"""import socket, subprocess, sys
+server = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+server.bind((socket.VMADDR_CID_ANY, int(sys.argv[1])))
+server.listen()
+print("listening", flush=True)
+while True:
+    connection, _ = server.accept()
+    with connection:
+        subprocess.Popen(sys.argv[2:], stdin=connection, stdout=connection)
+"""
+MCP_SERVER = b"""import json, os, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    method, params = message["method"], message.get("params", {})
+    if method == "initialize":
+        result = {
+            "protocolVersion": params["protocolVersion"],
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "guest-smoke", "version": "1"},
+        }
+    elif method == "tools/list":
+        result = {"tools": [{"name": "uname", "inputSchema": {"type": "object"}}]}
+    elif method == "tools/call":
+        text = os.uname().release + " " + params["arguments"]["word"]
+        result = {"content": [{"type": "text", "text": text}]}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
+"""
+
+
+def ext4_fsid(path):
+    # ext4 statfs() derives f_fsid from the superblock UUID: compare the guest's root.
+    with open(path, "rb") as image:
+        image.seek(1024 + 0x68)
+        uuid_bytes = image.read(16)
+    return int.from_bytes(uuid_bytes[:8], "little") ^ int.from_bytes(uuid_bytes[8:], "little")
+
+
+class Sink(io.RawIOBase):
+    def __init__(self, keep=False):
+        self.digest = hashlib.sha256()
+        self.size = 0
+        self.eof = False
+        self.data = bytearray() if keep else None
+
+    def write(self, data):
+        self.digest.update(data)
+        self.size += len(data)
+        if self.data is not None:
+            self.data += data
+        return len(data)
+
+    def close(self):
+        self.eof = True
+
+
+def serve_http(service):
+    """The real ASGI app and uvicorn WebSocket stack on an ephemeral loopback port."""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    host = f"127.0.0.1:{sock.getsockname()[1]}"
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_app(service, [host]),
+            lifespan="off",
+            ws="websockets-sansio",
+            ws_max_size=MAX_FRAME,
+            log_level="warning",
+        )
+    )
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not server.started:
+        if time.monotonic() > deadline:
+            raise AssertionError("HTTP server did not start")
+        time.sleep(0.01)
+    return f"http://{host}", server, thread
 
 
 def main():
@@ -39,7 +138,7 @@ def main():
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     backend = Firecracker(config)
     backend.preflight()
-    service = Service(store, backend, max_vms=config.get("max_vms", 16))
+    service = Service(store, backend, max_vms=config.get("max_vms", 16), **stream_settings(config))
     workspace = "smoke-" + uuid.uuid4().hex
     token = store.issue(workspace, max_vms=3, network=args.network)
     other = store.issue(workspace + "-other")
@@ -270,7 +369,9 @@ print("calculated 20 Fibonacci numbers", file=sys.stderr)
         call("vm_suspend", vm_id=vm, mode="hibernate", force=True)
         assert vm not in backend.processes
         time.sleep(1.1)
-        service = Service(store, backend, max_vms=config.get("max_vms", 16))
+        service = Service(
+            store, backend, max_vms=config.get("max_vms", 16), **stream_settings(config)
+        )
         started = time.monotonic()
         call("vm_resume", vm_id=vm)
         check(f"hibernate and restore after controller restart ({time.monotonic() - started:.3f}s)")
@@ -338,6 +439,172 @@ print("calculated 20 Fibonacci numbers", file=sys.stderr)
             ]
             assert sum(drops) >= 2, "blocked traffic did not reach host denial rules"
             check("host firewall counters confirm blocked egress")
+        image_ids = sorted(backend.images)
+        probe = "python3 -c 'import os; print(os.statvfs(\"/\").f_fsid)'"
+        fsids = {}
+        for image_id in image_ids:
+            image = backend.images[image_id]
+            started = time.monotonic()
+            vm_image = call(
+                "vm_create",
+                request_id=uuid.uuid4().hex,
+                image=image_id,
+                memory_mib=max(256, image.min_memory_mib),
+                vcpus=1,
+            )["id"]
+            created.append(vm_image)
+            boot = time.monotonic() - started
+            assert call("vm_status", vm_id=vm_image)["image"] == image_id
+            with (backend.directory(service.vms[vm_image]) / "kernel").open("rb") as kernel:
+                assert hashlib.file_digest(kernel, "sha256").hexdigest() == image.kernel_sha256
+            fsids[image_id] = ext4_fsid(image.rootfs)
+            assert int(execute(vm_image, probe)) == fsids[image_id]
+            call("vm_suspend", vm_id=vm_image)
+            assert vm_image not in backend.processes
+            call("vm_resume", vm_id=vm_image)
+            assert int(execute(vm_image, probe)) == fsids[image_id]
+            call("vm_destroy", vm_id=vm_image)
+            check(f"image {image_id}: pinned kernel, own rootfs, hibernate/resume ({boot:.3f}s)")
+        if len(image_ids) > 1:
+            assert len(set(fsids.values())) == len(fsids), "configured images share a rootfs"
+            restricted = store.issue(workspace + "-image", images=[image_ids[1]])
+            try:
+                service.call(restricted, "vm_create", {"request_id": "deny", "image": image_ids[0]})
+                raise AssertionError("image restriction not enforced")
+            except ServiceError as exc:
+                assert exc.status == 403, exc
+            check(f"token restricted to {image_ids[1]} refused for {image_ids[0]}")
+        # Host-to-guest streams through the real HTTP/WebSocket stack; guest network off.
+        endpoint, http_server, http_thread = serve_http(service)
+        token_file = tempfile.NamedTemporaryFile("w", dir=store.directory, delete=False)
+        try:
+            token_file.write(token)
+            token_file.close()
+            for name, data in (("vsock_serve.py", VSOCK_SERVE), ("mcp_server.py", MCP_SERVER)):
+                call(
+                    "vm_write_file",
+                    vm_id=vm,
+                    path=name,
+                    data_base64=base64.b64encode(data).decode(),
+                )
+            listeners = []
+            for port, command in (
+                (5000, "python3 -u mcp_server.py"),
+                (5001, "sh -c 'cat > big.bin'"),
+                (5002, "cat big.bin"),
+                (5003, "sha256sum"),
+            ):
+                listener = call(
+                    "vm_exec",
+                    vm_id=vm,
+                    request_id=uuid.uuid4().hex,
+                    command=f"python3 -u vsock_serve.py {port} {command}",
+                    timeout_seconds=1800,
+                )
+                deadline = time.monotonic() + 10
+                while "listening" not in call("vm_job_output", vm_id=vm, **listener)["stdout"]:
+                    assert time.monotonic() < deadline, "guest vsock listener did not start"
+                    time.sleep(0.05)
+                listeners.append(listener)
+
+            async def mcp_round_trip():
+                server = StdioServerParameters(
+                    command=sys.executable,
+                    args=[
+                        "-m",
+                        "microvm_mcp.cli",
+                        "attach",
+                        "--endpoint",
+                        endpoint,
+                        "--token-file",
+                        token_file.name,
+                        "--vm",
+                        vm,
+                        "--port",
+                        "5000",
+                    ],
+                )
+                async with stdio_client(server) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        tools = await session.list_tools()
+                        result = await session.call_tool("uname", {"word": "via-vsock"})
+                return [tool.name for tool in tools.tools], result.content[0].text
+
+            listed, text = asyncio.run(mcp_round_trip())
+            assert listed == ["uname"] and text.endswith(" via-vsock"), (listed, text)
+            check("MCP stdio round trip through attach and a guest vsock stream")
+            # Client EOF reaches the guest after all data (the upload below). Firecracker
+            # has no host half-close, so a guest reply after EOF is lost; assert that
+            # documented limit rather than silently depending on it.
+            sink = Sink(keep=True)
+            with tempfile.TemporaryFile() as stdin:
+                stdin.write(b"x" * 65536)
+                stdin.seek(0)
+                attach(endpoint, token, vm, 5003, stdin, sink)
+            assert bytes(sink.data) == b"", sink.data
+            check("no half-close: guest output after client EOF is dropped, as documented")
+            # Stay within four active jobs per VM: the copy check below needs an exec.
+            call("vm_job_cancel", vm_id=vm, **listeners.pop())
+            size = 100 * 1024**2
+            digest = hashlib.sha256()
+            with tempfile.TemporaryFile(dir=store.directory) as stdin:
+                for _ in range(size // 1024**2):
+                    chunk = os.urandom(1024**2)
+                    digest.update(chunk)
+                    stdin.write(chunk)
+                stdin.seek(0)
+                started = time.monotonic()
+                assert attach(endpoint, token, vm, 5001, stdin, Sink()) == 0
+                upload = time.monotonic() - started
+            assert execute(vm, "sha256sum big.bin").split()[0] == digest.hexdigest()
+            sink = Sink()
+            started = time.monotonic()
+            with open(os.devnull, "rb") as empty:
+                assert attach(endpoint, token, vm, 5002, empty, sink, send_eof=False) == 0
+            download = time.monotonic() - started
+            assert (sink.size, sink.digest.hexdigest()) == (size, digest.hexdigest())
+            check(f"100 MiB stream copy in {upload:.2f}s and out {download:.2f}s, digests match")
+
+            def refused(credential, port):
+                try:
+                    with connect(
+                        stream_url(endpoint, vm, port),
+                        additional_headers={"Authorization": f"Bearer {credential}"},
+                        open_timeout=30,
+                    ):
+                        pass
+                except InvalidStatus as exc:
+                    return exc.response.status_code
+                raise AssertionError(f"stream to port {port} accepted")
+
+            assert refused(token, 1024) == 403
+            assert refused(other, 5000) == 404
+            assert refused(token, 5099) == 409
+            check("control port, other workspace and closed guest port refused")
+            with connect(
+                stream_url(endpoint, vm, 5000),
+                additional_headers={"Authorization": f"Bearer {token}"},
+            ) as ws:
+                try:
+                    call("vm_suspend", vm_id=vm, force=False)
+                    raise AssertionError("suspension allowed with an open stream")
+                except ServiceError as exc:
+                    assert exc.code == "busy", exc
+                call("vm_suspend", vm_id=vm, force=True)
+                for _ in ws:
+                    pass
+                assert (ws.close_code, ws.close_reason) == (1001, "suspended")
+            call("vm_resume", vm_id=vm)
+            listed, text = asyncio.run(mcp_round_trip())
+            assert text.endswith(" via-vsock"), text
+            check("stream closed by hibernation; guest listener reachable after resume")
+            for listener in listeners:
+                call("vm_job_cancel", vm_id=vm, **listener)
+        finally:
+            http_server.should_exit = True
+            http_thread.join(10)
+            os.unlink(token_file.name)
         store.revoke(workspace)
         try:
             call("vm_list")
@@ -358,6 +625,7 @@ print("calculated 20 Fibonacci numbers", file=sys.stderr)
             store.save_vm(vm)
         store.revoke(workspace)
         store.revoke(workspace + "-other")
+        store.revoke(workspace + "-image")
         lock.close()
 
 

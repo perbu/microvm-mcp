@@ -123,9 +123,9 @@ kubectl apply -k deploy/k8s/manifests
 
 ## Install the guest image
 
-The pod starts and waits until the configured rootfs exists. Copy in the
-independently verified kernel and rootfs, then install them onto the state
-volume:
+The pod starts and waits until every configured image's rootfs exists. Copy in
+the independently verified kernel and rootfs, then install them onto the state
+volume. Repeat for each `[images.<id>]` table in the ConfigMap:
 
 ```sh
 kubectl -n microvm-mcp exec microvm-mcp-0 -c microvm-mcp -- \

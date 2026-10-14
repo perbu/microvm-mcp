@@ -15,8 +15,10 @@ import threading
 import time
 from pathlib import Path
 
+from . import images
 from .errors import ServiceError
 from .network import Network, names
+from .streams import CONTROL_PORT
 
 FICLONE = 0x40049409
 MAX_FRAME = 512 * 1024
@@ -55,9 +57,7 @@ class Firecracker:
         self.jails = self.root / "jails"
         self.binary = Path(config["firecracker"]).resolve()
         self.jailer = Path(config["jailer"]).resolve()
-        self.kernel = Path(config["kernel"]).resolve()
-        self.image = Path(config["rootfs"]).resolve()
-        self.image_id = config["image_id"]
+        self.images, self.default_image = images.load(config)
         with self.binary.open("rb") as src:
             self.runtime_id = hashlib.file_digest(src, "sha256").hexdigest()
         self.network = Network(
@@ -75,7 +75,7 @@ class Firecracker:
             raise ValueError("Firecracker jailer requires root; use a dedicated host service")
         with open("/dev/kvm", "rb+"):
             pass
-        for path in (self.binary, self.jailer, self.kernel, self.image):
+        for path in (self.binary, self.jailer):
             if not path.is_file():
                 raise ValueError(f"missing required file: {path}")
         for path in (self.binary, self.jailer):
@@ -105,25 +105,40 @@ class Firecracker:
             and Path("/proc/sys/net/ipv4/ip_forward").read_text().strip() != "1"
         ):
             raise ValueError("networking requires operator-enabled IPv4 forwarding")
-        # Verify operator-pinned artifacts. No implicit latest-image lookup.
-        for key, path in (("rootfs_sha256", self.image), ("kernel_sha256", self.kernel)):
-            with path.open("rb") as src:
-                digest = hashlib.file_digest(src, "sha256").hexdigest()
-            if digest != self.config[key]:
-                raise ValueError(f"artifact digest mismatch: {key}")
-        probe = self.root / "reflink-probe"
-        try:
-            clone(self.image, probe)
-        finally:
-            probe.unlink(missing_ok=True)
+        # Verify every operator-pinned image. No implicit latest-image lookup.
+        for image in self.images.values():
+            for key, path in (("rootfs_sha256", image.rootfs), ("kernel_sha256", image.kernel)):
+                if not path.is_file():
+                    raise ValueError(f"missing required file: {path}")
+                with path.open("rb") as src:
+                    digest = hashlib.file_digest(src, "sha256").hexdigest()
+                if digest != getattr(image, key):
+                    raise ValueError(f"artifact digest mismatch: image {image.id} {key}")
+            # Each image may sit on its own volume; every one must reflink into state.
+            probe = self.root / "reflink-probe"
+            try:
+                clone(image.rootfs, probe)
+            finally:
+                probe.unlink(missing_ok=True)
 
     def directory(self, vm):
         return self.jails / self.binary.name / vm["id"] / "root"
 
+    def disk_bytes(self, vm):
+        if "disk_bytes" in vm:
+            return vm["disk_bytes"]
+        if vm.get("image") in self.images:
+            return self.images[vm["image"]].rootfs.stat().st_size
+        # A retained VM whose image left the configuration keeps its fixed-size disk.
+        try:
+            return (self.directory(vm) / "disk.ext4").stat().st_size
+        except FileNotFoundError:
+            return 0
+
     def storage_reservation(self, vm):
         # Worst-case private disk, two full memory generations during replacement,
         # and bounded kernel / metadata overhead. No thin-provisioning overcommit.
-        return self.image.stat().st_size + 2 * vm["memory_mib"] * 1024**2 + 128 * 1024**2
+        return self.disk_bytes(vm) + 2 * vm["memory_mib"] * 1024**2 + 128 * 1024**2
 
     def api(self, vm, method, path, body):
         connection = UnixHTTP(self.directory(vm) / "api.sock")
@@ -214,11 +229,14 @@ class Firecracker:
             raise ServiceError(
                 "disk_full", "Insufficient space for a private disk and checkpoints", 409
             )
+        # The VM keeps private copies; resume never reads the image bundle again.
+        image = self.images[vm["image"]]
+        vm["disk_bytes"] = image.rootfs.stat().st_size
         directory = self.directory(vm)
         directory.mkdir(parents=True, mode=0o700)
         uid = self.uid_base + vm["slot"]
-        clone(self.image, directory / "disk.ext4")
-        shutil.copyfile(self.kernel, directory / "kernel")
+        clone(image.rootfs, directory / "disk.ext4")
+        shutil.copyfile(image.kernel, directory / "kernel")
         for path in (directory, directory / "disk.ext4", directory / "kernel"):
             os.chown(path, uid, uid)
         try:
@@ -266,18 +284,45 @@ class Firecracker:
             self.network.destroy(vm)
             raise
 
-    def guest(self, vm, operation, args, *, timeout=10):
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+    def vsock(self, vm, port, timeout):
+        """Host-initiated connection to a guest vsock port through Firecracker's UDS."""
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
             sock.settimeout(timeout)
             sock.connect(str(self.directory(vm) / "guest.sock"))
+            sock.sendall(f"CONNECT {port}\n".encode())
+            # Byte-at-a-time: anything after the reply line is guest stream data.
+            reply = bytearray()
+            while not reply.endswith(b"\n") and len(reply) < 128:
+                chunk = sock.recv(1)
+                if not chunk:
+                    break
+                reply += chunk
+            if not reply.startswith(b"OK ") or not reply.endswith(b"\n"):
+                raise ConnectionRefusedError(f"guest vsock port {port} refused")
+            return sock
+        except BaseException:
+            sock.close()
+            raise
+
+    def connect(self, vm, port, *, timeout=5):
+        try:
+            sock = self.vsock(vm, port, timeout)
+        except OSError:
+            raise ServiceError("port_unavailable", "No guest listener on that port", 409) from None
+        sock.settimeout(None)
+        return sock
+
+    def guest(self, vm, operation, args, *, timeout=10):
+        try:
+            sock = self.vsock(vm, CONTROL_PORT, timeout)
+        except ConnectionRefusedError:
+            raise ServiceError(
+                "guest_unavailable", "Guest control channel unavailable", 502
+            ) from None
+        with sock:
             file = sock.makefile("rwb")
             try:
-                file.write(b"CONNECT 1024\n")
-                file.flush()
-                if not file.readline(128).startswith(b"OK "):
-                    raise ServiceError(
-                        "guest_unavailable", "Guest control channel unavailable", 502
-                    )
                 file.write(json.dumps({"op": operation, "args": args}).encode() + b"\n")
                 file.flush()
                 raw = file.readline(MAX_FRAME + 1)

@@ -16,9 +16,10 @@ the existing `host_fetch` transport; no harness or demo code changes are require
 - Host-issued opaque workspace tokens, SHA-256 token hashes in SQLite, expiration,
   rotation without changing ownership, and workspace revocation. Every request is
   authenticated; every VM/job/file operation checks workspace ownership.
-- One Debian 13 image with Python, Node, Git, Bash, GCC and standard build tools.
-  Guest commands run as UID 1000. Customize the trusted image recipe to install
-  system packages; the API does not grant root or passwordless sudo to commands.
+- Operator-configured guest images, chosen per VM. The recipe builds a Debian 13
+  image with Python, Node, Git, Bash, GCC and standard build tools. Guest commands
+  run as UID 1000. Customize the trusted image recipe to install system packages;
+  the API does not grant root or passwordless sudo to commands.
 - One jailed Firecracker process and cgroup per VM. Distinct jail UIDs, private
   network namespaces, CPU/memory/PID limits, no host-directory mounts in the guest.
 - Reflink CoW raw ext4 disks on an XFS/Btrfs host filesystem. Unsupported storage
@@ -27,8 +28,10 @@ the existing `host_fetch` transport; no harness or demo code changes are require
   a shared output bound; cancellation/timeouts
   cover descendants through guest cgroups, including processes that call setsid.
 - Workspace file transfer using base64, bounded to 128 KiB per call, with symlink
-  traversal refused. Larger artifacts can be inspected through command output;
-  bulk upload/download is not part of this first pass.
+  traversal refused. Larger artifacts move over a guest stream.
+- Host-to-guest byte streams over vsock, authorized like every other operation,
+  for MCP servers in the guest, operator shells, VNC and bulk transfer, with
+  guest networking off.
 - Manual pause (retains RAM), hibernate (full memory/device checkpoint, releases
   the VMM process), resume, automatic idle suspension, and automatic wake on work.
 - Network off by default. Network on adds IPv4 NAT with guest-source enforcement,
@@ -122,7 +125,41 @@ sudo install -d -m 0700 /var/lib/microvm-mcp
 Copy `examples/service.toml`, set the binary/kernel/image paths, and replace the
 digest placeholders using `sha256sum`. The image digest pins the deployed image;
 the Docker recipe uses Debian package repositories and is not a bit-reproducible
-historical rebuild. Reserve unused host UIDs starting at `uid_base`, one per VM
+historical rebuild.
+
+### Guest images
+
+Each `[images.<id>]` table is one bootable image. `rootfs` and `kernel` default to
+`<state_dir>/images/<id>/rootfs.ext4` and `vmlinux`, the layout written by
+`microvm-mcp-install-image`, which prints the table to paste. One image is
+marked `default = true`; it boots when `vm_create` names none.
+
+```toml
+[images.debian-13-dev-v1]
+rootfs_sha256 = "..."
+kernel_sha256 = "..."
+default = true
+
+[images.re-analysis-v1]
+rootfs_sha256 = "..."
+kernel_sha256 = "..."
+min_memory_mib = 4096  # refuse smaller VMs; also the default memory_mib
+# memory_mib = 6144    # default when vm_create omits memory_mib
+```
+
+Every configured image's rootfs and kernel digests are verified, and a reflink is
+probed, before the service accepts requests. Unknown keys and malformed IDs fail
+startup. A configuration with the older top-level `image_id`, `rootfs`, `kernel`,
+`rootfs_sha256` and `kernel_sha256` still works as one default image; mixing both
+forms is an error. `vm_create` advertises the configured IDs as an enum, and
+`vm_status` reports each VM's image.
+
+A VM copies its kernel and clones its disk at creation, so pause, hibernate and
+resume never read the image again. Removing an image from the configuration does
+not strand its paused or hibernated VMs; the service logs them at startup, and
+they can be resumed, used and destroyed, but no new VM can boot that image.
+Restoring still requires the Firecracker binary the VM was created with. Storage
+reservations use each image's own rootfs size, recorded on the VM. Reserve unused host UIDs starting at `uid_base`, one per VM
 slot. Do not reuse this range for host users or another service instance.
 
 Networking needs operator-enabled IPv4 forwarding and an explicit `uplink`.
@@ -140,6 +177,10 @@ sudo .venv/bin/microvm-mcp issue-token \
 sudo .venv/bin/microvm-mcp serve --config /etc/microvm-mcp.toml
 ```
 
+`--image ID` (repeatable) restricts a workspace to those images, the same way
+`--allow-network` grants networking; without it the workspace may use any
+configured image. A refused image returns 403 `forbidden`.
+
 Issuance is a local administrator action, not an MCP tool. Token files are 0600
 and are never printed. Give the trusted client/broker read access to its token
 file. Reissuing for the same workspace creates another token and preserves its
@@ -151,8 +192,8 @@ sudo .venv/bin/microvm-mcp revoke-workspace \
   --state-dir /var/lib/microvm-mcp --workspace demo-alice
 ```
 
-Revocation prevents future access, including refresh by this CLI. Existing jobs
-are not automatically killed. An operator needing immediate containment must stop
+Revocation prevents future access, including refresh by this CLI, and closes
+open guest streams within 5 seconds. Existing jobs are not automatically killed. An operator needing immediate containment must stop
 the workspace's VM cgroups as well. An integrated revoke-and-stop admin command is
 not implemented. Credential expiry likewise does not delete VM state.
 
@@ -182,6 +223,7 @@ with an unknown outcome is also refused instead of executing again.
 Tools: `vm_create`, `vm_list`, `vm_status`, `vm_exec`, `vm_job_status`,
 `vm_job_output`, `vm_job_cancel`, `vm_read_file`, `vm_write_file`, `vm_suspend`,
 `vm_resume`, `vm_destroy`. Discovery advertises their complete JSON schemas.
+`vm_create` takes an optional `image` from the configured IDs.
 File paths and command working directories are relative to `/workspace`.
 There are at most four active jobs and 256 total jobs per VM.
 
@@ -241,6 +283,77 @@ the guest image, pin its new SHA-256 in the service config, and create new VMs.
 Existing guests and restored checkpoints keep their old supervisor; restarting
 the host service alone does not upgrade them.
 
+## Guest streams
+
+A host client can open a two-way byte stream to a vsock port in an owned VM:
+
+```text
+GET /v1/vms/{vm_id}/streams/{port}   (WebSocket upgrade)
+Authorization: Bearer <workspace credential>
+```
+
+The service connects through the VM's Firecracker vsock socket, the same path as
+the control channel, so it works with `network=off`. Connections go host to guest
+only. A program in the guest listens on its own port; nothing listens by default.
+For example, started with `vm_exec`:
+
+```sh
+socat VSOCK-LISTEN:5000,fork EXEC:'my-mcp-server --stdio'   # if socat is in the image
+```
+
+The `fork` option starts a fresh process per connection. A long-lived server that
+holds state across reconnections, such as a Ghidra session, should accept
+connections itself.
+
+Requests pass the same host allowlist, no-`Origin`, bearer and ownership checks as
+the tools. Refusals happen before any guest connection: 401 for credentials, 404
+for another workspace's VM, 403 for port 1024 (the guest supervisor) or ports
+outside `stream_ports`, 409 for a full stream quota or no guest listener. Opening
+a stream wakes a suspended VM. Binary messages carry bytes; text messages are
+sent as their UTF-8 bytes. Client messages are limited to 1 MiB.
+
+- **EOF.** An empty binary message from the client is end-of-file for the guest.
+  Firecracker's vsock bridge has no half-close: the guest reads the remaining data
+  and then EOF, but the connection then closes in both directions, so a guest
+  cannot reply after it. Protocols that need a reply after the input ends need an
+  in-band end marker. The stream closes with code 1000 when the guest closes its
+  end.
+- **Lifecycle.** An open stream counts as activity, so automatic idle suspension
+  waits for it to close. Manual suspend refuses with `busy` unless `force=true`.
+  Any suspension or destroy closes the VM's streams with code 1001 and reason
+  `suspended` or `destroyed`. Guest listeners survive; clients reconnect after
+  resume. Credentials are rechecked every 5 seconds, and revocation or expiry
+  closes the stream with 1008. `vm_status` reports the number of open streams.
+- **Limits.** Configure them in the service TOML (defaults shown):
+
+  ```toml
+  stream_ports = [[1025, 65535]]   # inclusive ranges; [] disables streams; 1024 is refused
+  max_streams = 32                 # host-wide
+  max_streams_per_workspace = 8
+  max_streams_per_vm = 4
+  stream_rate_bytes = 33554432     # per direction per stream; 0 is unlimited
+  ```
+
+  Streams grant no authority beyond `vm_exec`, which already moves data into and
+  out of the workspace's own VM, so there is no separate token grant.
+- **Logging.** Open and close are logged with workspace, VM, port, duration, byte
+  counts and close reason, never payload.
+
+`microvm-mcp attach` bridges stdin/stdout to a stream. That makes a guest stdio
+MCP server usable as an ordinary MCP client's command. The token is read from a
+file and never appears on the command line:
+
+```sh
+microvm-mcp attach --endpoint http://127.0.0.1:8090 \
+  --token-file /run/microvm-alice.token --vm <vm_id> --port 5000
+# Upload: the guest program reads EOF after the file.
+microvm-mcp attach ... --port 5001 < archive.tar
+# Download: keep the stream open after stdin ends; the guest closes it.
+microvm-mcp attach ... --port 5002 --ignore-stdin-eof < /dev/null > out.bin
+```
+
+It exits 0 when the guest closes normally and 1 on refusal or any other close.
+
 ## Suspension and failure semantics
 
 Creation defaults to hibernating after 300 idle seconds. Set `idle_seconds=0` to
@@ -289,8 +402,8 @@ Graceful service shutdown checkpoints running/paused VMs, including active jobs.
 After a service crash, hibernated VMs remain restorable; other VMs are marked
 failed and leftover processes are killed through their owned cgroups. They can
 be inspected/deleted, but automatic recovery of in-flight commands is deferred.
-There is no HA, cross-host migration, VM sharing, interactive terminal, inbound
-web preview, automatic VM retention expiry, or public production deployment in
+There is no HA, cross-host migration, VM sharing, built-in interactive terminal
+(a stream can carry one that the guest provides), inbound web preview, automatic VM retention expiry, or public production deployment in
 this first pass. Guest roots/checkpoints are sensitive workspace data and remain
 inside the service's private state directory.
 
@@ -350,7 +463,14 @@ smoke boots jailed VMs, checks Fibonacci output, separate streams, UTF-8 paginat
 binary output, and output limits, compiles generated C, checks disk isolation, preserves a
 running process across suspension, checks wall time and managed timeouts across
 pause, hibernation, and pause-to-hibernate transitions, checks automatic
-hibernation, verifies network policy, and denies cross-workspace access. It deletes
+hibernation, verifies network policy, and denies cross-workspace access. For
+every configured image it boots a VM and checks the kernel copy's digest and
+the guest root filesystem's identity across hibernate/resume. With two or more
+images, it checks that a token restricted to one is refused for the other. It runs
+an MCP stdio round trip through `attach` and a guest vsock stream, copies 100 MiB
+each way, and checks refusals, half-close behavior and stream closure on
+hibernation. Run it with the legacy single-image configuration and with an
+`[images]` configuration listing two distinct images. It deletes
 its VMs and revokes its credentials in cleanup. See `VALIDATION.md` for measured
 results and the history of smoke failures and fixes.
 

@@ -1,5 +1,41 @@
 # Validation
 
+## Per-VM images and guest vsock streams — 2026-10-14
+
+- Ruff lint/format and **132 unit tests passed**, no skips (development Python
+  3.14). New tests cover image configuration, legacy compatibility, the
+  configured-ID enum, image-restricted tokens, store migration, per-image storage
+  reservation, resume of a VM whose image left the configuration, and stream
+  authorization, limits, lifecycle, revocation and the `attach` client through a
+  real uvicorn WebSocket server. The unit backend's stream peer is an in-process
+  echo; it executes nothing.
+- Real Firecracker 1.17.0/KVM smoke, run from the source tree against an isolated
+  state directory, lock and jail UID range on the host's XFS volume, so the
+  installed service kept running untouched. Guest code is unchanged; image
+  `50b13f41…7df3` and kernel `e20e46d0…d4f2` as before.
+  - Legacy top-level `image_id` configuration: **all 31 checks passed**.
+  - `[images]` configuration with that image as default plus a second image (a
+    reflink copy with a new ext4 UUID, installed with `microvm-mcp-install-image`,
+    `min_memory_mib = 512`): **all 33 checks passed**. Each image booted with its
+    own pinned kernel copy, and the guest's root `f_fsid` matched that image's
+    superblock UUID before and after hibernate/resume. A token restricted to the
+    second image was refused (403) for the first.
+  - Streams with guest networking off: MCP SDK stdio client → `microvm-mcp attach`
+    → WebSocket → vsock → stdlib JSON-RPC server in the guest (initialize,
+    tools/list, tools/call). A 100 MiB upload and download matched SHA-256 in
+    2.16 s each way. That is the default 32 MiB/s per-direction cap after its
+    one-second burst, not raw throughput. Port 1024, another workspace and a
+    closed guest port were refused (403/404/409). Hibernation closed an open stream
+    with 1001 and the guest listener was reachable again after resume.
+- **Firecracker has no host half-close.** A raw probe without the HTTP layer
+  confirmed it: after `shutdown(SHUT_WR)` on the host side of `guest.sock`, the
+  guest reads the data and EOF, but its reply is dropped. The first stream design
+  waited for EOF in both directions and hung a download whose client sent no EOF.
+  Streams now end when the guest closes, and `attach --ignore-stdin-eof` covers
+  downloads. The smoke asserts the documented loss of post-EOF guest output.
+- `--network` was not exercised in these runs, to avoid sharing `10.231.<slot>`
+  ranges with the live service on this host. Networking code is unchanged.
+
 ## Debian vendor packaging — 2026-09-20
 
 - Built three amd64 packages in a digest-pinned Debian 13 container: service

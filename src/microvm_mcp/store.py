@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -11,6 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .errors import ServiceError
+from .images import IMAGE_ID
 
 
 class Store:
@@ -44,6 +46,11 @@ class Store:
                 PRIMARY KEY(owner, operation, key)
             );
         """)
+        columns = {r["name"] for r in self.db.execute("PRAGMA table_info(workspaces)")}
+        if "images" not in columns:
+            # NULL means any configured image, preserving pre-existing workspaces.
+            with self.db:
+                self.db.execute("ALTER TABLE workspaces ADD COLUMN images TEXT")
         os.chmod(self.directory / "state.sqlite", 0o600)
 
     @contextmanager
@@ -52,7 +59,15 @@ class Store:
             yield self.db
 
     def issue(
-        self, workspace, *, ttl=3600, max_vms=1, max_memory_mib=2048, max_vcpus=2, network=False
+        self,
+        workspace,
+        *,
+        ttl=3600,
+        max_vms=1,
+        max_memory_mib=2048,
+        max_vcpus=2,
+        network=False,
+        images=None,
     ):
         if not workspace or len(workspace) > 128 or ttl <= 0:
             raise ValueError("invalid workspace or token lifetime")
@@ -60,6 +75,10 @@ class Store:
             raise ValueError("invalid quota")
         if not 1 <= max_vcpus <= 8:
             raise ValueError("invalid CPU quota")
+        if images is not None:
+            if not images or not all(re.fullmatch(IMAGE_ID, i) for i in images):
+                raise ValueError("invalid image restriction")
+            images = json.dumps(sorted(set(images)))
         token = secrets.token_urlsafe(32)
         with self.transaction() as db:
             existing = db.execute("SELECT * FROM workspaces WHERE id=?", (workspace,)).fetchone()
@@ -67,8 +86,10 @@ class Store:
                 raise ValueError("workspace is revoked; provision a new workspace")
             # Rotation preserves policy and ownership. It cannot silently widen permissions.
             db.execute(
-                "INSERT OR IGNORE INTO workspaces VALUES (?, ?, ?, ?, ?, 0)",
-                (workspace, max_vms, max_memory_mib, max_vcpus, int(network)),
+                """INSERT OR IGNORE INTO workspaces
+                (id, max_vms, max_memory_mib, max_vcpus, network, revoked, images)
+                VALUES (?, ?, ?, ?, ?, 0, ?)""",
+                (workspace, max_vms, max_memory_mib, max_vcpus, int(network), images),
             )
             db.execute(
                 "INSERT INTO tokens VALUES (?, ?, ?, 0)",
@@ -87,7 +108,9 @@ class Store:
             ).fetchone()
         if not row or row["revoked"] or row["token_revoked"] or row["expires"] <= time.time():
             raise ServiceError("unauthorized", "Valid workspace credential required", 401)
-        return dict(row)
+        grant = dict(row)
+        grant["images"] = None if grant["images"] is None else json.loads(grant["images"])
+        return grant
 
     def revoke(self, workspace):
         with self.transaction() as db:

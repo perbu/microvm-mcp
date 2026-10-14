@@ -20,8 +20,9 @@ state volume. Requires root. Checks both SHA-256 digests and reflink support
 between the installed rootfs and state directory before publishing the bundle.
 The default state directory is /var/lib/microvm-mcp.
 .PP
-Existing image bundles are not overwritten. The command prints TOML values
-for the operator to place in /etc/microvm-mcp.toml; it does not edit configuration
+Existing image bundles are not overwritten. The command prints an
+[images.ID] TOML table for the operator to add to /etc/microvm-mcp.toml; one
+configured image must be marked default = true. It does not edit configuration
 or start the service. Guest code is not executed by this installer.
 .SH EXIT STATUS
 Zero means the bundle was installed. Nonzero means installation failed.

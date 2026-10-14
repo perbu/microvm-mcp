@@ -28,6 +28,15 @@ changing the tool contract. Changes to guest code require rebuilding the image
 and pinning its digest before real-VM validation; old VMs and checkpoints do not
 automatically pick up supervisor changes.
 
+## Images and streams
+
+Only operator configuration names bootable images; tokens may narrow them, tool
+arguments only choose among them. VMs keep private kernel/disk copies, so resume
+must never depend on an image still being configured. Guest streams are host to
+guest only, refuse the control port 1024, close on any suspension, and log
+metadata only, never payload. Firecracker's vsock bridge has no host half-close;
+the smoke test asserts this, so revisit the EOF contract if it starts failing.
+
 ## Suspension and clocks
 
 Freeze the guest jobs cgroup before pausing vCPUs. Correct guest CLOCK_REALTIME

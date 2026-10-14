@@ -1,17 +1,27 @@
 import concurrent.futures
+import socket
+import threading
 import time
+from pathlib import Path
 
 import pytest
 
 from microvm_mcp.errors import ServiceError
+from microvm_mcp.images import Image
 from microvm_mcp.service import Service
 from microvm_mcp.store import Store
+
+
+def image(image_id, **kw):
+    return Image(image_id, Path("rootfs"), Path("vmlinux"), "0" * 64, "0" * 64, **kw)
 
 
 class Backend:
     """Control-plane fake; deliberately incapable of executing code."""
 
-    image_id = "test-image"
+    images = {"test-image": image("test-image")}
+    default_image = "test-image"
+    runtime_id = "test-runtime"
 
     def __init__(self):
         self.calls = []
@@ -42,6 +52,22 @@ class Backend:
             self.jobs[args["job_id"]] = {"state": "running"}
             return {"job_id": args["job_id"]}
         return {"ok": True}
+
+    def connect(self, vm, port):
+        # A canned echo peer, not a guest: greets, echoes, closes after EOF.
+        self.calls.append(("connect", port))
+        host, peer = socket.socketpair()
+
+        def echo():
+            with peer:
+                peer.sendall(b"ready\n")
+                if port == 5001:  # Download-style: send and close without reading.
+                    return
+                while data := peer.recv(65536):
+                    peer.sendall(data)
+
+        threading.Thread(target=echo, daemon=True).start()
+        return host
 
 
 @pytest.fixture

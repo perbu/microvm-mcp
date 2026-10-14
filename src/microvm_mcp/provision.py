@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 
 from .firecracker import clone
+from .images import IMAGE_ID
 
 
 def copy_verified(source, destination, expected):
@@ -35,7 +36,7 @@ def copy_verified(source, destination, expected):
 
 
 def install(state_dir, image_id, rootfs, kernel, rootfs_sha256, kernel_sha256):
-    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}", image_id):
+    if not re.fullmatch(IMAGE_ID, image_id):
         raise ValueError("image ID must be 1-80 letters, digits, dots, underscores or hyphens")
     state_dir = state_dir.resolve()
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -98,6 +99,8 @@ def main():
         parser.error("image installation requires root")
     os.umask(0o077)
     manifest = install(**vars(args))
-    print("# Set these values in /etc/microvm-mcp.toml:")
+    print("# Add this table to /etc/microvm-mcp.toml. Mark one image default = true.")
+    print(f"[images.{manifest['image_id']}]")
     for key, value in manifest.items():
-        print(f"{key} = {json.dumps(value)}")
+        if key != "image_id":
+            print(f"{key} = {json.dumps(value)}")

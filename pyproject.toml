@@ -9,7 +9,12 @@ description = "Workspace-authorized Linux development microVMs over MCP and HTTP
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-dependencies = ["mcp==2.2.0", "jsonschema>=4.26,<5", "uvicorn>=0.53,<0.54"]
+dependencies = [
+    "mcp==2.2.0",
+    "jsonschema>=4.26,<5",
+    "uvicorn>=0.53,<0.54",
+    "websockets>=15,<17",
+]
 
 [project.scripts]
 microvm-mcp = "microvm_mcp.cli:main"

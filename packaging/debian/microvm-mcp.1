@@ -11,6 +11,8 @@ microvm-mcp \- private development microVM service and administrator CLI
 .I NAME
 .B --output
 .I FILE
+.RB [ --image
+.IR ID ]...
 .br
 .B microvm-mcp revoke-workspace --state-dir
 .I DIRECTORY
@@ -19,6 +21,16 @@ microvm-mcp \- private development microVM service and administrator CLI
 .br
 .B microvm-mcp demo-manifest --endpoint
 .I URL
+.br
+.B microvm-mcp attach --token-file
+.I FILE
+.B --vm
+.I VM_ID
+.B --port
+.I PORT
+.RB [ --endpoint
+.IR URL ]
+.RB [ --ignore-stdin-eof ]
 .SH DESCRIPTION
 Runs workspace-authorized Firecracker microVMs over HTTP and MCP.
 The serve command requires root, KVM, cgroup v2, pinned guest artifacts and
@@ -27,7 +39,14 @@ Use each subcommand's --help option for its complete arguments.
 .PP
 Workspace credentials are issued locally and written to mode-0600 files.
 Never place credentials in guest images, model prompts or tool arguments.
-Workspace revocation denies future requests but does not stop existing jobs.
+Workspace revocation denies future requests and closes open guest streams,
+but does not stop existing jobs. issue-token --image restricts a workspace to
+the named guest images.
+.PP
+The attach command bridges standard input and output to a vsock port of an
+owned VM, for example as an MCP client's stdio server command. It reads the
+credential from a file. Firecracker has no vsock half-close: after standard
+input ends, the guest reads EOF but cannot reply.
 .SH FILES
 .I /etc/microvm-mcp.toml
 .br

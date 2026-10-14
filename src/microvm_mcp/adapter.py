@@ -15,7 +15,7 @@ def inline(value):
     return json.dumps(value)
 
 
-def manifest(endpoint, secret_ref="microvm_workspace", vm_class="exec"):
+def manifest(endpoint, secret_ref="microvm_workspace", vm_class="exec", tools=TOOLS):
     url = urlsplit(endpoint)
     if (
         url.scheme not in ("https", "http")
@@ -35,7 +35,7 @@ def manifest(endpoint, secret_ref="microvm_workspace", vm_class="exec"):
         "# Append to an existing fast-agent tools manifest with this VM class.",
         "# One credential = one workspace. All sessions in this deployment share it.",
     ]
-    for tool in TOOLS:
+    for tool in tools:
         name = tool["name"]
         out.extend(
             [

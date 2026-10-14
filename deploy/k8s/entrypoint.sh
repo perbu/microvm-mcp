@@ -44,8 +44,19 @@ with open(sys.argv[1], "rb") as source:
     print(tomllib.load(source)[sys.argv[2]])
 ' "$config" "$1"
 }
+# Every configured rootfs: each [images.<id>] (default bundle path) or legacy rootfs.
+rootfs_paths() {
+    "$python" -I -B -c '
+import sys, tomllib
+with open(sys.argv[1], "rb") as source:
+    config = tomllib.load(source)
+if "images" not in config:
+    print(config["rootfs"])
+for image_id, image in config.get("images", {}).items():
+    print(image.get("rootfs", f"{config['"'"'state_dir'"'"']}/images/{image_id}/rootfs.ext4"))
+' "$config"
+}
 state_dir=$(setting state_dir)
-rootfs=$(setting rootfs)
 [ -d "$state_dir" ] || die "state volume is not mounted: $state_dir"
 chmod 0700 "$state_dir"
 
@@ -55,10 +66,12 @@ if [ "${MICROVM_MAINTENANCE:-0}" = 1 ]; then
     echo "microvm-mcp-entrypoint: maintenance mode; service not started" >&2
     exec sleep infinity
 fi
-while [ ! -f "$rootfs" ]; do
-    echo "microvm-mcp-entrypoint: waiting for guest image $rootfs" \
-        "(install it with microvm-mcp-install-image)" >&2
-    sleep 30
+for rootfs in $(rootfs_paths); do
+    while [ ! -f "$rootfs" ]; do
+        echo "microvm-mcp-entrypoint: waiting for guest image $rootfs" \
+            "(install it with microvm-mcp-install-image)" >&2
+        sleep 30
+    done
 done
 
 exec /usr/bin/microvm-mcp serve --config "$config"

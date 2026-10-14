@@ -90,8 +90,11 @@ sudo microvm-mcp-install-image \
 
 It preserves sparse zero regions, verifies both copies, tests a reflink from the
 image into the state directory, and publishes a new bundle under `images/` only
-after success. Existing bundles are never updated in place. Copy its printed
-TOML values into `/etc/microvm-mcp.toml`, then configure quotas, UID range, and
+after success. Existing bundles are never updated in place. Add its printed
+`[images.<id>]` table to `/etc/microvm-mcp.toml` and mark the image `vm_create`
+uses by default with `default = true`. Several images can be installed and
+configured side by side; a top-level `image_id`/`rootfs`/`kernel` configuration
+from earlier releases keeps working as one default image. Then configure quotas, UID range, and
 optional networking. The default listener remains on loopback.
 
 ```sh

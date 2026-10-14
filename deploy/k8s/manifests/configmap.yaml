@@ -9,13 +9,6 @@ data:
     state_dir = "/var/lib/microvm-mcp"
     firecracker = "/usr/lib/microvm-mcp/firecracker/1.17.0/firecracker"
     jailer = "/usr/lib/microvm-mcp/firecracker/1.17.0/jailer"
-    # Paths printed by microvm-mcp-install-image; images live on the state volume
-    # because reflinks cannot cross filesystems.
-    kernel = "/var/lib/microvm-mcp/images/debian-13-dev-v1/vmlinux"
-    rootfs = "/var/lib/microvm-mcp/images/debian-13-dev-v1/rootfs.ext4"
-    image_id = "debian-13-dev-v1"
-    rootfs_sha256 = "REPLACE_WITH_BUILT_IMAGE_SHA256"
-    kernel_sha256 = "REPLACE_WITH_PINNED_KERNEL_SHA256"
     # Without user namespaces these are node UIDs: keep the range unused on the
     # node itself. Preflight can only check the container's /etc/passwd.
     uid_base = 62000
@@ -37,6 +30,13 @@ data:
       "microvm-mcp.microvm-mcp.svc.cluster.local",
       "vms.example.com",  # REPLACE or remove: external name, if exposed
     ]
+    # One table per image, as printed by microvm-mcp-install-image. Images live on
+    # the state volume (default <state_dir>/images/<id>/) because reflinks cannot
+    # cross filesystems.
+    [images.debian-13-dev-v1]
+    rootfs_sha256 = "REPLACE_WITH_BUILT_IMAGE_SHA256"
+    kernel_sha256 = "REPLACE_WITH_PINNED_KERNEL_SHA256"
+    default = true
   # The service listens on 127.0.0.1 only; this sidecar is the pod's only
   # listener. It preserves the client's Host header for the allowlist above.
   Caddyfile: |

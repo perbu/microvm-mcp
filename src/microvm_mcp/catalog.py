@@ -1,8 +1,13 @@
 """One catalog for MCP, HTTP validation, and optional client adapters."""
 
+import copy
+
+from .images import IMAGE_ID
+
 ID = {"type": "string", "pattern": "^[a-f0-9]{32}$"}
 KEY = {"type": "string", "minLength": 1, "maxLength": 128}
 PATH = {"type": "string", "minLength": 1, "maxLength": 1024}
+IMAGE = {"type": "string", "pattern": f"^{IMAGE_ID}$"}
 
 
 def tool(name, description, properties=None, required=()):
@@ -21,9 +26,11 @@ def tool(name, description, properties=None, required=()):
 TOOLS = [
     tool(
         "vm_create",
-        "Create a private Debian development VM; retry with the same request_id.",
+        "Create a private Linux development VM; retry with the same request_id. "
+        "image selects an operator-configured guest image (default when omitted).",
         {
             "request_id": KEY,
+            "image": IMAGE,
             "network": {"enum": ["off", "on"], "default": "off"},
             "vcpus": {"type": "integer", "minimum": 1, "maximum": 8, "default": 2},
             "memory_mib": {"type": "integer", "minimum": 256, "maximum": 8192, "default": 1024},
@@ -125,3 +132,17 @@ TOOLS = [
     ),
 ]
 BY_NAME = {t["name"]: t for t in TOOLS}
+
+
+def tools(image_ids=()):
+    """The catalog with vm_create.image narrowed to the configured image IDs."""
+    if not image_ids:
+        return TOOLS
+    result = copy.deepcopy(TOOLS)
+    for tool in result:
+        if tool["name"] == "vm_create":
+            tool["inputSchema"]["properties"]["image"] = {
+                "type": "string",
+                "enum": sorted(image_ids),
+            }
+    return result
