@@ -221,6 +221,67 @@ def create_app(service, allowed_hosts):
             group.start_soon(watchdog)
         return outcome[0] if outcome else (1011, "stream error")
 
+    async def pump_broker(websocket, session, token):
+        """Run one attachment until it ends; recheck the credential meanwhile."""
+        outcome = []
+
+        async with anyio.create_task_group() as group:
+
+            def finish(code, reason=""):
+                if not outcome:
+                    outcome.append((code, reason))
+                group.cancel_scope.cancel()
+
+            async def run():
+                finish(*await session.run(websocket))
+
+            async def watchdog():
+                while True:
+                    await anyio.sleep(RECHECK_SECONDS)
+                    try:
+                        await anyio.to_thread.run_sync(service.store.authenticate, token)
+                    except ServiceError:
+                        finish(1008, "credential invalid")
+                        return session.pipe.detach("credential invalid", session)
+
+            group.start_soon(run)
+            group.start_soon(watchdog)
+        return outcome[0] if outcome else (1011, "broker pipe error")
+
+    async def broker_endpoint(websocket):
+        vm_id = websocket.path_params["vm_id"]
+        job_id = websocket.path_params["job_id"]
+        token = TOKEN.get()
+        offered = websocket.headers.getlist("x-broker-pipe")
+        pipe_token = offered[0] if len(offered) == 1 else ""
+        loop = asyncio.get_running_loop()
+        try:
+            if not VM_ID.fullmatch(vm_id) or not VM_ID.fullmatch(job_id):
+                raise ServiceError("not_found", "Job not found", 404)
+            # Shielded: an attached session must reach close_broker below.
+            with anyio.CancelScope(shield=True):
+                session = await anyio.to_thread.run_sync(
+                    service.open_broker, token, vm_id, job_id, pipe_token, loop
+                )
+        except ServiceError as exc:
+            return await deny(websocket, JSONResponse(exc.body(), exc.status))
+        except Exception:
+            LOG.exception("broker open failed")
+            error = ServiceError("backend_failure", "Broker pipe failed; inspect VM status", 502)
+            return await deny(websocket, JSONResponse(error.body(), error.status))
+        code, reason = 1011, "broker pipe error"
+        try:
+            await websocket.accept()
+            code, reason = await pump_broker(websocket, session, token)
+        finally:
+            # Non-blocking: it detaches only this session and logs metadata.
+            service.close_broker(session, reason or "closed")
+        if code is not None:
+            try:
+                await websocket.close(code, reason)
+            except Exception:
+                pass
+
     async def stream_endpoint(websocket):
         vm_id, port = websocket.path_params["vm_id"], websocket.path_params["port"]
         token = TOKEN.get()
@@ -277,6 +338,7 @@ def create_app(service, allowed_hosts):
         custom_starlette_routes=[
             Route("/v1/tools/{name}", http_tool, methods=["POST"]),
             WebSocketRoute("/v1/vms/{vm_id}/streams/{port:int}", stream_endpoint),
+            WebSocketRoute("/v1/vms/{vm_id}/jobs/{job_id}/broker", broker_endpoint),
         ],
     )
     return AccessBoundary(app, service, allowed_hosts)

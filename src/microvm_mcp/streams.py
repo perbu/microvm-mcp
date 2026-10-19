@@ -5,7 +5,9 @@ import time
 
 import anyio
 
+BROKER_PORT = 1023  # Job broker pipe; guest-to-host only, never a public stream.
 CONTROL_PORT = 1024  # The guest supervisor's RPC channel; never a stream target.
+RESERVED_PORTS = (BROKER_PORT, CONTROL_PORT)
 MAX_PORT = 2**32 - 2  # VMADDR_PORT_ANY is reserved.
 CHUNK = 64 * 1024
 
@@ -23,8 +25,8 @@ def port_ranges(value):
         low, high = item
         if not 1 <= low <= high <= MAX_PORT:
             raise ValueError(f"invalid stream port range: {low}-{high}")
-        if low <= CONTROL_PORT <= high:
-            raise ValueError("stream_ports must exclude the guest control port 1024")
+        if any(low <= port <= high for port in RESERVED_PORTS):
+            raise ValueError("stream_ports must exclude guest ports 1023 and 1024")
         ranges.append((low, high))
     return tuple(ranges)
 

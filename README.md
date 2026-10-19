@@ -117,8 +117,9 @@ substitute for storage isolation from unrelated host services.
 
 ```sh
 uv sync --locked
-# Docker and mkfs.ext4 are needed only to build the image. Preserve guest UIDs.
-sudo scripts/build-image /var/lib/microvm-images
+# Docker, mkfs.ext4 >= 1.47.1 and debugfs are needed only to build the image.
+# No root: ownership comes from the export, and the script checks it.
+scripts/build-image /var/lib/microvm-images
 sudo install -d -m 0700 /var/lib/microvm-mcp
 ```
 
@@ -307,8 +308,9 @@ connections itself.
 
 Requests pass the same host allowlist, no-`Origin`, bearer and ownership checks as
 the tools. Refusals happen before any guest connection: 401 for credentials, 404
-for another workspace's VM, 403 for port 1024 (the guest supervisor) or ports
-outside `stream_ports`, 409 for a full stream quota or no guest listener. Opening
+for another workspace's VM, 403 for port 1023 (the job broker pipe), port 1024
+(the guest supervisor), or ports outside `stream_ports`, 409 for a full stream
+quota or no guest listener. Opening
 a stream wakes a suspended VM. Binary messages carry bytes; text messages are
 sent as their UTF-8 bytes. Client messages are limited to 1 MiB.
 
@@ -327,7 +329,7 @@ sent as their UTF-8 bytes. Client messages are limited to 1 MiB.
 - **Limits.** Configure them in the service TOML (defaults shown):
 
   ```toml
-  stream_ports = [[1025, 65535]]   # inclusive ranges; [] disables streams; 1024 is refused
+  stream_ports = [[1025, 65535]]   # inclusive ranges; [] disables streams; 1023 and 1024 are refused
   max_streams = 32                 # host-wide
   max_streams_per_workspace = 8
   max_streams_per_vm = 4
@@ -353,6 +355,112 @@ microvm-mcp attach ... --port 5002 --ignore-stdin-eof < /dev/null > out.bin
 ```
 
 It exits 0 when the guest closes normally and 1 on refusal or any other close.
+
+## Job broker pipe
+
+`vm_exec` accepts an optional `broker_pipe_token`: a one-time unguessable token
+(`secrets.token_urlsafe(32)` or another 43–128 character `[A-Za-z0-9_-]` value).
+The service stores only its SHA-256, in memory. The token is not written to
+receipts, VM status, logs, or the guest, and a retried `request_id` does not
+replace the hash. The guest is told `broker_pipe: true`, the job id, and a
+separate random route secret. That secret only routes guest connections to this
+job's pipe, and like the hash it lives only in memory. The response adds
+`"broker_pipe": true` once the guest confirms it started the listener. An image
+built before the pipe returns `"broker_pipe": false`, and no pipe is kept.
+
+For that job the guest supervisor listens on `/run/fa-broker/broker.sock` inside
+a mount namespace private to the job, mode `0660` and group 1000. Other jobs do
+not see the path. The listener accepts a connection only when the peer process
+is in this job's cgroup, which also refuses another job that reaches the socket
+through `/proc/<pid>/root`. The listener runs as `nobody` (uid 65534), so job
+processes cannot read its route secret, which reaches it on a pipe and never in
+argv. Its cgroup is a sibling of the job's under the jobs cgroup. It freezes
+with the jobs at suspension and is killed when the job ends, including by
+cancellation or timeout. It relays at most 32 connections at a time. The job
+environment is the workspace broker client, with a non-secret placeholder
+capability and no storage credentials:
+
+```text
+FA_WORKSPACE_BACKEND=broker
+FA_WORKSPACE_BROKER_URL=http://127.0.0.1/v1/call
+FA_WORKSPACE_BROKER_CAPABILITY=fa-broker-placeholder
+FA_WORKSPACE_MAX_OBJECT_BYTES=67108864
+```
+
+`FA_WORKSPACE_SCOPE` is unset. The HTTP target is `POST /v1/call` on
+`/run/fa-broker/broker.sock`. Guest networking stays off. A client that opens
+that socket and writes the broker request, including the placeholder bearer
+token, is carried to the host unchanged.
+
+Each accepted socket is forwarded to the host on Firecracker's guest-to-host
+vsock `<uds_path>_1023` (port 1023). It starts with a 97-byte preamble: the
+32-hex job id, the 64-hex route secret, and a newline. Raw bytes follow. Any
+guest process can open port 1023, so the host routes only on a matching route
+secret. A job id alone reaches nothing. The host reads every preamble without
+blocking, with at most 64 pending at once and 2 seconds each. Port 1023 is not
+a public stream and is not served at `/v1/vms/{vm_id}/streams/{port}`.
+
+Jobs share uid 1000, so this isolation covers who can connect. It does not
+cover debugging: a job allowed to ptrace another job's processes can act as
+them. Run one job per VM when that matters.
+
+The controller that knows the token attaches:
+
+```text
+GET /v1/vms/{vm_id}/jobs/{job_id}/broker   (WebSocket upgrade)
+Authorization: Bearer <workspace credential>
+X-Broker-Pipe: <broker_pipe_token>
+```
+
+The same host allowlist, no-`Origin`, and bearer checks apply. A wrong token,
+another workspace, an unknown or finished job, or a VM without this pipe is
+404. A second concurrent attach is 409, and so is a fifth attached pipe on one
+VM. WebSocket messages are binary. The payload is a byte stream of big-endian
+frames, which a message may split or combine:
+
+| Kind | `type` | Layout |
+| --- | --- | --- |
+| open | 1 | `u8 type, u32 conn_id` |
+| data | 2 | `u8 type, u32 conn_id, u32 length, payload` with `length <= 65536` |
+| close | 3 | `u8 type, u32 conn_id` |
+
+`conn_id` is nonzero. The service assigns it and sends `open` when a guest
+connection arrives. The controller sends `data` and `close` only. The service
+copies bytes and does not interpret them. The controller splices its end to the
+local broker and replaces `Authorization: Bearer fa-broker-placeholder` with the
+session capability. That splice stays outside this service.
+
+- **Close.** A `close` from the controller is delivered after the `data` queued
+  before it. A `close` from the service means the guest connection is gone.
+  Firecracker does not forward a guest half-close to the host, so a guest client
+  may shut down its write side and still read the reply. Each side ignores
+  frames for a connection it has already closed. A `conn_id` the service never
+  assigned closes the pipe with 1002.
+- **Limits.** One attachment carries at most 64 guest connections; 32 more can
+  wait for a controller. Up to 1 MiB of controller data is buffered for each
+  guest connection. When a guest stops reading, the service stops reading the
+  WebSocket. After 10 seconds without progress, that connection alone is closed.
+  `stream_rate_bytes` applies to each direction of an attachment. The service
+  reads guest data only as fast as the WebSocket drains, and holds no thread
+  per pipe or connection.
+
+An open pipe counts as activity, so idle suspension waits for it. Manual suspend
+refuses with `busy` unless `force=true`. Suspend and destroy close the pipe with
+WebSocket code 1001 and reason `suspended` or `destroyed`. The pipe is kept
+across suspension: after resume the same token attaches again. The pipe is
+removed once the service sees its job completed, through a status refresh, job
+polling, or the idle sweep, which checks VMs with pipes every 5 seconds. An
+attached controller then gets 1001 `job finished`. If the guest rejects the
+`vm_exec`, no pipe is kept. Credentials are rechecked every 5 seconds;
+revocation or expiry closes it with 1008. Close and open are logged with
+workspace, VM, job, duration, byte counts, and reason. The token, the route
+secret, and the payload are never logged. Neither secret survives a service
+restart.
+
+**Upgrade note:** existing guest images ignore `broker_pipe` until the image is
+rebuilt and its digest is pinned. Restarting the host service does not upgrade a
+running guest or a restored checkpoint. Old images keep working; they report
+`"broker_pipe": false` and do not open the socket.
 
 ## Suspension and failure semantics
 

@@ -1,5 +1,38 @@
 # Validation
 
+## Job broker pipe after review fixes — 2026-10-19
+
+- Ruff lint/format and **159 unit tests passed**, no skips (development Python
+  3.14). New tests cover route-secret routing (a job id alone, or another job's
+  secret, reaches no pipe), silent and partial preambles, late frames after a
+  guest close, a failed guest write and a stalled guest closing only their own
+  connection, no thread per guest connection, stale cleanup leaving a newer
+  attachment, the per-VM attach limit, retirement on job completion, failed
+  and unsupported exec, and reattach after hibernation. The unit backend
+  executes nothing; guest broker code is covered only by pure helpers.
+- Guest image `debian-13-dev-v2` built without root by the revised
+  `scripts/build-image` (`mkfs.ext4 -d` reading the Docker export tarball). The
+  supervisor, init, Python and `/etc` are root-owned in the image, setuid bits
+  are kept, and `/workspace` belongs to uid 1000. Rootfs `4b68c8b1…fa85`, kernel
+  `e20e46d0…d4f2` as before. Installed with `microvm-mcp-install-image` and pinned
+  through the legacy top-level configuration.
+- Real Firecracker 1.17.0/KVM smoke with that configuration, installed service
+  stopped for the run: **all 32 checks passed**. The broker check ran with guest
+  networking off:
+  - A guest client wrote a request, shut down its write side, and still read
+    the controller's reply. **Firecracker does not forward a guest half-close to
+    the host**, so a host EOF means the guest connection is gone.
+  - A job without the pipe did not see `/run/fa-broker/broker.sock`.
+  - Reaching that socket through `/proc/<pid>/root` was refused by the listener's
+    peer-cgroup check.
+  - A raw vsock connection to port 1023 with the right job id and a wrong route
+    secret was closed, and nothing reached the controller.
+  - The job saw only the placeholder capability, no `FA_WORKSPACE_SCOPE`.
+  - Status polling after the job finished closed the attached controller with
+    1001 `job finished`.
+- uvicorn logged `ASGI callable returned without completing handshake` once for
+  each of the four refused stream requests; the refusal statuses were correct.
+
 ## Per-VM images and guest vsock streams — 2026-10-14
 
 - Ruff lint/format and **132 unit tests passed**, no skips (development Python

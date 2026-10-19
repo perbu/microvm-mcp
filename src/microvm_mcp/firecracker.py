@@ -18,7 +18,7 @@ from pathlib import Path
 from . import images
 from .errors import ServiceError
 from .network import Network, names
-from .streams import CONTROL_PORT
+from .streams import BROKER_PORT, CONTROL_PORT
 
 FICLONE = 0x40049409
 MAX_FRAME = 512 * 1024
@@ -300,6 +300,27 @@ class Firecracker:
                 reply += chunk
             if not reply.startswith(b"OK ") or not reply.endswith(b"\n"):
                 raise ConnectionRefusedError(f"guest vsock port {port} refused")
+            return sock
+        except BaseException:
+            sock.close()
+            raise
+
+    def broker_listen(self, vm):
+        """Listen where Firecracker connects guest-to-host vsock port 1023.
+
+        The jailer sees uds_path `/guest.sock`, so a guest connection to the host
+        arrives on `guest.sock_<port>` inside the jail. The jail user must be able
+        to connect; this process keeps the accept fd.
+        """
+        path = self.directory(vm) / f"guest.sock_{BROKER_PORT}"
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            path.unlink(missing_ok=True)
+            sock.bind(str(path))
+            uid = self.uid_base + vm["slot"]
+            os.chown(path, uid, uid)
+            os.chmod(path, 0o600)
+            sock.listen(128)
             return sock
         except BaseException:
             sock.close()

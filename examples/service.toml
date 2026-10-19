@@ -9,7 +9,8 @@ port = 8090
 # uplink = "eth0"  # required only for network=on; IPv4 forwarding must already be enabled
 # blocked_cidrs = ["YOUR_PUBLIC_MANAGEMENT_SUBNET/24"]
 # allowed_hosts = ["127.0.0.1:8090", "vms.example.com"]  # TLS reverse proxy Host header
-# Guest vsock streams (defaults shown). Port 1024, the guest supervisor, is refused.
+# Guest vsock streams (defaults shown). Ports 1023 (broker pipe) and 1024
+# (guest supervisor) are refused.
 # stream_ports = [[1025, 65535]]
 # max_streams = 32
 # max_streams_per_workspace = 8

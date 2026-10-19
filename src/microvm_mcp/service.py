@@ -1,15 +1,21 @@
+import hashlib
+import hmac
 import logging
+import secrets
 import threading
 import time
 import uuid
 
 from jsonschema import Draft202012Validator
 
+from .broker import MAX_ATTACHED, BrokerAcceptor, BrokerPipe
 from .catalog import tools
 from .errors import ServiceError
-from .streams import CONTROL_PORT, Stream, port_ranges
+from .streams import RESERVED_PORTS, Stream, port_ranges
 
 LOG = logging.getLogger(__name__)
+# How often the idle sweep asks the guest whether broker jobs are still running.
+BROKER_RECHECK_SECONDS = 5
 
 
 class Service:
@@ -43,6 +49,11 @@ class Service:
         self.stream_rate_bytes = stream_rate_bytes
         # vm_id -> open Stream objects. Mutated only under self.guard.
         self.streams = {}
+        # vm_id -> {job_id: BrokerPipe}. Token hashes and route secrets are memory-only:
+        # never receipts, status, or logs. Mutated only under self.guard.
+        self.brokers = {}
+        self.broker_listeners = {}
+        self.broker_checked = {}
         self.guard = threading.RLock()
         self.vms = {v["id"]: v for v in store.vms()}
         self.locks = {key: threading.RLock() for key in self.vms}
@@ -131,7 +142,8 @@ class Service:
             if vm is None or vm["owner"] != grant["id"]:
                 raise ServiceError("not_found", "VM not found", 404)
             lock = self.locks[vm_id]
-        if port == CONTROL_PORT or not any(lo <= port <= hi for lo, hi in self.stream_ports):
+        allowed = any(low <= port <= high for low, high in self.stream_ports)
+        if port in RESERVED_PORTS or not allowed:
             raise ServiceError("forbidden", "Guest port is not open to streams", 403)
         with lock:
             self.store.authenticate(token)
@@ -185,6 +197,140 @@ class Service:
             streams = self.streams.pop(vm["id"], set())
         for stream in streams:
             stream.close(reason)
+
+    def pipes(self, vm):
+        with self.guard:
+            return list(self.brokers.get(vm["id"], {}).values())
+
+    def broker_attached(self, vm):
+        return any(pipe.session is not None for pipe in self.pipes(vm))
+
+    def ensure_broker_listener(self, vm):
+        current = self.broker_listeners.get(vm["id"])
+        if current is not None and current.alive():
+            return
+        if current is not None:
+            current.close()
+        sock = self.backend.broker_listen(vm)
+        self.broker_listeners[vm["id"]] = BrokerAcceptor(
+            sock,
+            lambda job_id, route, conn, vm_id=vm["id"]: self.route_broker(
+                vm_id, job_id, route, conn
+            ),
+        )
+
+    def close_broker_listener(self, vm):
+        listener = self.broker_listeners.pop(vm["id"], None)
+        if listener is not None:
+            listener.close()
+
+    def route_broker(self, vm_id, job_id, route, sock):
+        """Acceptor thread. Any guest process can reach port 1023; only the job's
+        listener knows its route secret, so the job id alone never selects a pipe."""
+        with self.guard:
+            pipe = self.brokers.get(vm_id, {}).get(job_id)
+        expected = pipe.route if pipe is not None else b"\0" * len(route)
+        if not hmac.compare_digest(expected, route) or pipe is None:
+            sock.close()
+            return
+        pipe.add_guest(sock)
+
+    def register_broker(self, vm, job_id, token):
+        """Return the route secret for the guest listener. It is not the token."""
+        route = secrets.token_hex(32)
+        pipe = BrokerPipe(
+            vm["id"],
+            vm["owner"],
+            job_id,
+            hashlib.sha256(token.encode()).digest(),
+            route.encode(),
+        )
+        with self.guard:
+            self.brokers.setdefault(vm["id"], {})[job_id] = pipe
+        return route
+
+    def retire_broker(self, vm, job_id, reason):
+        with self.guard:
+            pipes = self.brokers.get(vm["id"], {})
+            pipe = pipes.pop(job_id, None)
+            if not pipes:
+                self.brokers.pop(vm["id"], None)
+        if pipe is None:
+            return
+        pipe.retire(reason)
+        if not self.pipes(vm):
+            self.close_broker_listener(vm)
+
+    def retire_finished_brokers(self, vm):
+        for pipe in self.pipes(vm):
+            if vm["jobs"].get(pipe.job_id, {}).get("state") == "completed":
+                self.retire_broker(vm, pipe.job_id, "job finished")
+
+    def detach_brokers(self, vm, reason):
+        for pipe in self.pipes(vm):
+            pipe.detach(reason)
+
+    def forget_brokers(self, vm):
+        with self.guard:
+            pipes = self.brokers.pop(vm["id"], {})
+        for pipe in pipes.values():
+            pipe.retire("destroyed")
+        self.close_broker_listener(vm)
+
+    def open_broker(self, credential, vm_id, job_id, pipe_token, loop):
+        """Attach the controller that presented this job's one-time token."""
+        grant = self.store.authenticate(credential)
+        if not isinstance(pipe_token, str) or not 43 <= len(pipe_token) <= 128:
+            raise ServiceError("not_found", "Job not found", 404)
+        with self.guard:
+            vm = self.vms.get(vm_id)
+            if vm is None or vm["owner"] != grant["id"]:
+                raise ServiceError("not_found", "VM not found", 404)
+            lock = self.locks[vm_id]
+        with lock:
+            self.store.authenticate(credential)
+            with self.guard:
+                pipe = self.brokers.get(vm_id, {}).get(job_id)
+            offered = hashlib.sha256(pipe_token.encode()).digest()
+            expected = pipe.token_hash if pipe is not None else b"\0" * 32
+            # Same status for an unknown job, another workspace's VM, and a wrong token.
+            if (
+                not hmac.compare_digest(expected, offered)
+                or pipe is None
+                or pipe.retired is not None
+                or vm["state"] == "destroyed"
+                or vm["jobs"].get(job_id, {}).get("state") == "completed"
+            ):
+                raise ServiceError("not_found", "Job not found", 404)
+            if sum(p.session is not None for p in self.pipes(vm)) >= MAX_ATTACHED:
+                raise ServiceError("quota_exceeded", "Broker pipe limit reached", 409)
+            self.resume(vm)
+            self.ensure_broker_listener(vm)
+            session = pipe.attach(loop, self.stream_rate_bytes)
+            vm["last_activity"] = time.time()
+            self.store.save_vm(vm)
+        # The token and the pipe payload are not logged.
+        LOG.info("broker=open workspace=%s vm=%s job=%s", grant["id"], vm_id, job_id)
+        return session
+
+    def close_broker(self, session, reason):
+        """End one attachment. A late call for an older attachment leaves a newer one."""
+        pipe = session.pipe
+        pipe.detach(reason, session)
+        if session.logged:
+            return
+        session.logged = True
+        LOG.info(
+            "broker=close workspace=%s vm=%s job=%s reason=%s seconds=%.1f "
+            "bytes_to_guest=%d bytes_from_guest=%d",
+            pipe.owner,
+            pipe.vm_id,
+            pipe.job_id,
+            session.reason,
+            time.monotonic() - session.opened_at,
+            session.to_guest,
+            session.from_guest,
+        )
 
     def create(self, grant, args):
         old = self.store.reserve(grant["id"], "vm_create", args["request_id"], args)
@@ -275,6 +421,9 @@ class Service:
                 self.store.save_vm(vm)
         if vm["state"] != "running":
             raise ServiceError("invalid_state", "VM is not runnable", 409)
+        # Hibernate relaunch removes the vsock socket; pause keeps the listener.
+        if self.pipes(vm):
+            self.ensure_broker_listener(vm)
 
     def refresh(self, vm):
         status = self.backend.guest(vm, "status", {})
@@ -286,6 +435,7 @@ class Service:
         if active:
             vm["last_activity"] = time.time()
         self.store.save_vm(vm)
+        self.retire_finished_brokers(vm)
         return active
 
     def suspend(self, vm, mode, force=False):
@@ -299,10 +449,15 @@ class Service:
         if vm["state"] == "running" and not force:
             if self.streams.get(vm["id"]):
                 raise ServiceError("busy", "Open streams prevent suspension", 409)
+            if self.broker_attached(vm):
+                raise ServiceError("busy", "Open broker pipe prevents suspension", 409)
             if self.refresh(vm):
                 raise ServiceError("busy", "Active jobs prevent suspension", 409)
         # Firecracker resets vsock connections across a restore; clients reconnect.
         self.close_streams(vm, "suspended")
+        self.detach_brokers(vm, "suspended")
+        if mode != "pause":
+            self.close_broker_listener(vm)
         previous = vm["state"]
         vm["state"] = "suspending"
         self.store.save_vm(vm)
@@ -310,6 +465,7 @@ class Service:
             self.backend.suspend(vm, mode, previous)
             vm["state"] = target
         except Exception:
+            self.close_broker_listener(vm)
             vm["state"] = "failed"
             raise
         finally:
@@ -322,6 +478,7 @@ class Service:
         if name == "vm_destroy":
             if vm["state"] != "destroyed":
                 self.close_streams(vm, "destroyed")
+                self.forget_brokers(vm)
                 self.backend.destroy(vm)
                 vm["state"] = "destroyed"
                 self.store.save_vm(vm)
@@ -342,6 +499,8 @@ class Service:
         if name == "vm_resume":
             return self.public(vm)
         if name == "vm_exec":
+            # The token is not part of the retry receipt, the guest RPC, or the result.
+            pipe_token = args.pop("broker_pipe_token", None)
             operation = f"vm_exec:{vm['id']}"
             old = self.store.reserve(vm["owner"], operation, args["request_id"], args)
             if old is not None:
@@ -353,12 +512,31 @@ class Service:
             # uncertain job; never automatically replay an effectful command.
             vm["jobs"][job_id] = {"state": "unknown"}
             self.store.save_vm(vm)
-            result = self.backend.guest(vm, "exec", {**args, "job_id": job_id})
+            guest_args = {**args, "job_id": job_id}
+            if pipe_token is not None:
+                self.ensure_broker_listener(vm)
+                guest_args["broker_pipe"] = True
+                guest_args["broker_route"] = self.register_broker(vm, job_id, pipe_token)
+            try:
+                result = self.backend.guest(vm, "exec", guest_args)
+            except BaseException:
+                if pipe_token is not None:
+                    self.retire_broker(vm, job_id, "exec failed")
+                raise
+            if pipe_token is not None:
+                # Images built before the pipe ignore it; report what the guest did.
+                supported = result.get("broker_pipe") is True
+                if not supported:
+                    self.retire_broker(vm, job_id, "unsupported guest")
+                result = {"job_id": result["job_id"], "broker_pipe": supported}
             vm["jobs"][job_id] = {"state": "running"}
             self.store.save_vm(vm)
             self.store.finish(vm["owner"], operation, args["request_id"], result)
             return result
-        return self.backend.guest(vm, name.removeprefix("vm_"), args)
+        result = self.backend.guest(vm, name.removeprefix("vm_"), args)
+        if "job_id" in args and result.get("state") == "completed":
+            self.retire_broker(vm, args["job_id"], "job finished")
+        return result
 
     def sweep(self):
         with self.guard:
@@ -367,9 +545,18 @@ class Service:
             if not lock.acquire(blocking=False):
                 continue
             try:
-                if vm["state"] != "running" or not vm["idle_seconds"]:
+                if vm["state"] != "running":
                     continue
-                if self.streams.get(vm["id"]):
+                now = time.monotonic()
+                if self.pipes(vm) and now - self.broker_checked.get(vm["id"], 0) >= (
+                    BROKER_RECHECK_SECONDS
+                ):
+                    # Retires pipes of finished jobs, so they stop counting as activity.
+                    self.broker_checked[vm["id"]] = now
+                    self.refresh(vm)
+                if not vm["idle_seconds"]:
+                    continue
+                if self.streams.get(vm["id"]) or self.broker_attached(vm):
                     # An attached client is activity; idle time counts from its close.
                     vm["last_activity"] = time.time()
                     continue
