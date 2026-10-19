@@ -79,6 +79,7 @@ def test_guest_close_ends_stream_without_client_eof(api):
         (lambda h, vm: ({"Authorization": "Bearer nope"}, path(vm)), 401),
         (lambda h, vm: ({**h, "Origin": "https://evil.test"}, path(vm)), 403),
         (lambda h, vm: ({**h, "Host": "evil.test"}, path(vm)), 403),
+        (lambda h, vm: (h, path(vm, 1023)), 403),
         (lambda h, vm: (h, path(vm, 1024)), 403),
         (lambda h, vm: (h, path(vm, 6000)), 403),
         (lambda h, vm: (h, path("x" * 32)), 404),
@@ -184,7 +185,8 @@ def test_data_after_eof_is_a_protocol_error(api):
 
 
 @pytest.mark.parametrize(
-    "ranges", [[[1000, 2000]], [[1024, 1024]], [[0, 10]], [[5, 4]], [[1, 2**32]], [[1, "2"]]]
+    "ranges",
+    [[[1000, 2000]], [[1023, 1023]], [[1024, 1024]], [[0, 10]], [[5, 4]], [[1, 2**32]], [[1, "2"]]],
 )
 def test_invalid_port_policy_fails_closed(tmp_path, ranges):
     with pytest.raises(ValueError):

@@ -17,6 +17,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
+from .broker import Parser, ProtocolError
 from .errors import ServiceError
 from .streams import CHUNK, Rate
 
@@ -221,6 +222,105 @@ def create_app(service, allowed_hosts):
             group.start_soon(watchdog)
         return outcome[0] if outcome else (1011, "stream error")
 
+    async def pump_broker(websocket, pipe, token):
+        """Copy one job's guest connections as a framed multiplex. Payload is not logged."""
+        # Detach replaces the attribute with None and wakes this queue.
+        outbound = pipe.outbound
+        if outbound is None:
+            return 1001, pipe.reason or "closed"
+        loop = asyncio.get_running_loop()
+        parser = Parser()
+        outcome = []
+
+        async with anyio.create_task_group() as group:
+
+            def finish(code, reason=""):
+                if not outcome:
+                    outcome.append((code, reason))
+                group.cancel_scope.cancel()
+
+            async def to_client():
+                while True:
+                    frame = await loop.run_in_executor(None, outbound.get)
+                    if frame is None:
+                        return finish(1001, pipe.reason or "closed")
+                    try:
+                        await websocket.send_bytes(frame)
+                    except Exception:
+                        return finish(None)
+
+            async def from_client():
+                while True:
+                    message = await websocket.receive()
+                    if message["type"] == "websocket.disconnect":
+                        return finish(None)
+                    data = message.get("bytes")
+                    if data is None:
+                        return finish(1002, "binary frames required")
+                    try:
+                        frames = parser.feed(data)
+                    except ProtocolError:
+                        return finish(1002, "bad frame")
+                    for kind, conn_id, payload in frames:
+                        try:
+                            await anyio.to_thread.run_sync(
+                                pipe.from_controller, kind, conn_id, payload
+                            )
+                        except ProtocolError:
+                            if pipe.reason is not None:
+                                return finish(1001, pipe.reason)
+                            return finish(1002, "bad frame")
+                        except OSError:
+                            return finish(1001, pipe.reason or "guest connection closed")
+
+            async def watchdog():
+                while True:
+                    await anyio.sleep(RECHECK_SECONDS)
+                    if pipe.reason is not None or pipe.outbound is not outbound:
+                        return finish(1001, pipe.reason or "closed")
+                    try:
+                        await anyio.to_thread.run_sync(service.store.authenticate, token)
+                    except ServiceError:
+                        pipe.detach("credential invalid")
+                        return finish(1008, "credential invalid")
+
+            group.start_soon(to_client)
+            group.start_soon(from_client)
+            group.start_soon(watchdog)
+        return outcome[0] if outcome else (1011, "broker pipe error")
+
+    async def broker_endpoint(websocket):
+        vm_id = websocket.path_params["vm_id"]
+        job_id = websocket.path_params["job_id"]
+        token = TOKEN.get()
+        offered = websocket.headers.getlist("x-broker-pipe")
+        pipe_token = offered[0] if len(offered) == 1 else ""
+        try:
+            if not VM_ID.fullmatch(vm_id) or not VM_ID.fullmatch(job_id):
+                raise ServiceError("not_found", "Job not found", 404)
+            with anyio.CancelScope(shield=True):
+                pipe = await anyio.to_thread.run_sync(
+                    service.open_broker, token, vm_id, job_id, pipe_token
+                )
+        except ServiceError as exc:
+            return await deny(websocket, JSONResponse(exc.body(), exc.status))
+        except Exception:
+            LOG.exception("broker open failed")
+            error = ServiceError("backend_failure", "Broker pipe failed; inspect VM status", 502)
+            return await deny(websocket, JSONResponse(error.body(), error.status))
+        code, reason = 1011, "broker pipe error"
+        try:
+            await websocket.accept()
+            code, reason = await pump_broker(websocket, pipe, token)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await anyio.to_thread.run_sync(service.close_broker, pipe, reason or "closed")
+        if code is not None:
+            try:
+                await websocket.close(code, reason)
+            except Exception:
+                pass
+
     async def stream_endpoint(websocket):
         vm_id, port = websocket.path_params["vm_id"], websocket.path_params["port"]
         token = TOKEN.get()
@@ -277,6 +377,7 @@ def create_app(service, allowed_hosts):
         custom_starlette_routes=[
             Route("/v1/tools/{name}", http_tool, methods=["POST"]),
             WebSocketRoute("/v1/vms/{vm_id}/streams/{port:int}", stream_endpoint),
+            WebSocketRoute("/v1/vms/{vm_id}/jobs/{job_id}/broker", broker_endpoint),
         ],
     )
     return AccessBoundary(app, service, allowed_hosts)

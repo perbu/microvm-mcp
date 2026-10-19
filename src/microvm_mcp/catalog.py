@@ -43,13 +43,21 @@ TOOLS = [
     tool("vm_status", "Read VM status without waking it.", {"vm_id": ID}, ["vm_id"]),
     tool(
         "vm_exec",
-        "Start a shell command in the VM. Returns a job handle; poll its output.",
+        "Start a shell command in the VM. Returns a job handle; poll its output. "
+        "broker_pipe_token opens a job-scoped guest-to-host pipe; the token is not "
+        "passed to the guest.",
         {
             "vm_id": ID,
             "request_id": KEY,
             "command": {"type": "string", "minLength": 1, "maxLength": 32768},
             "cwd": {**PATH, "default": "."},
             "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 300},
+            "broker_pipe_token": {
+                "type": "string",
+                "minLength": 43,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9_-]+$",
+            },
         },
         ["vm_id", "request_id", "command"],
     ),

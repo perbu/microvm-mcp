@@ -33,9 +33,11 @@ automatically pick up supervisor changes.
 Only operator configuration names bootable images; tokens may narrow them, tool
 arguments only choose among them. VMs keep private kernel/disk copies, so resume
 must never depend on an image still being configured. Guest streams are host to
-guest only, refuse the control port 1024, close on any suspension, and log
-metadata only, never payload. Firecracker's vsock bridge has no host half-close;
-the smoke test asserts this, so revisit the EOF contract if it starts failing.
+guest only, refuse ports 1023 and 1024, close on any suspension, and log
+metadata only, never payload. Port 1023 is the job broker pipe: the token is
+hashed in memory only and is not a guest, receipt, or log field. Firecracker's
+vsock bridge has no host half-close; the smoke test asserts this, so revisit
+the EOF contract if it starts failing.
 
 ## Suspension and clocks
 

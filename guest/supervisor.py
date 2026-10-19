@@ -3,6 +3,7 @@
 
 import base64
 import codecs
+import ctypes
 import json
 import os
 import select
@@ -25,6 +26,167 @@ MANAGED_PIDS = set()
 LOCK = threading.RLock()
 SUSPENDED_AT = None
 LIFECYCLE_PROTOCOL = 1
+# Host vsock port. Not a credential. The controller replaces the placeholder bearer.
+BROKER_PORT = 1023
+BROKER_SOCKET = "/run/fa-broker/broker.sock"
+BROKER_PLACEHOLDER = "fa-broker-placeholder"
+CLONE_NEWNS = 0x00020000
+MS_REC = 16384
+MS_PRIVATE = 1 << 18
+
+
+def broker_client_env():
+    """Broker client shape. The capability is a placeholder, not a workspace secret.
+
+    The process reaches that HTTP path by connecting to BROKER_SOCKET. Nothing
+    here is a folder root, bucket, or cloud credential.
+    """
+    return {
+        "FA_WORKSPACE_BACKEND": "broker",
+        "FA_WORKSPACE_BROKER_URL": "http://127.0.0.1/v1/call",
+        "FA_WORKSPACE_BROKER_CAPABILITY": BROKER_PLACEHOLDER,
+        "FA_WORKSPACE_MAX_OBJECT_BYTES": str(64 * 1024 * 1024),
+    }
+
+
+def _mount_private(target, source, fstype, flags, data):
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mount.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_ulong,
+        ctypes.c_char_p,
+    ]
+    libc.mount.restype = ctypes.c_int
+    if libc.mount(source, target, fstype, flags, data) != 0:
+        raise OSError(ctypes.get_errno(), f"mount failed: {target!r}")
+
+
+def private_broker_mount():
+    """A tmpfs visible only inside this job's mount namespace."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.unshare.argtypes = [ctypes.c_int]
+    libc.unshare.restype = ctypes.c_int
+    if libc.unshare(CLONE_NEWNS) != 0:
+        raise OSError(ctypes.get_errno(), "unshare mount namespace failed")
+    # unshare leaves mounts shared with the supervisor. Make them private before
+    # creating the socket directory, or every other job would see it.
+    _mount_private(b"/", None, None, MS_REC | MS_PRIVATE, None)
+    os.makedirs("/run/fa-broker", mode=0o755, exist_ok=True)
+    _mount_private(b"/run/fa-broker", b"tmpfs", b"tmpfs", 0, b"mode=755")
+
+
+def leave_job_cgroup():
+    """Move this process back beside PID 1 so it does not keep the job cgroup busy."""
+    line = Path("/proc/1/cgroup").read_text().strip().splitlines()[-1]
+    relative = line.split(":", 2)[-1].lstrip("/")
+    (Path("/sys/fs/cgroup") / relative / "cgroup.procs").write_text(str(os.getpid()))
+
+
+def relay_broker(conn, job_id):
+    """Forward one guest socket to the host. The first line is the job id."""
+    vsock = None
+    delay = 0.05
+    deadline = time.monotonic() + 30
+    try:
+        while time.monotonic() < deadline:
+            try:
+                vsock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+                vsock.connect((socket.VMADDR_CID_HOST, BROKER_PORT))
+                break
+            except OSError:
+                if vsock is not None:
+                    vsock.close()
+                vsock = None
+                time.sleep(delay)
+                delay = min(delay * 2, 0.5)
+        if vsock is None:
+            return
+        vsock.sendall(job_id.encode() + b"\n")
+
+        def pump(src, dst):
+            try:
+                while chunk := src.recv(65536):
+                    dst.sendall(chunk)
+            except OSError:
+                pass
+            finally:
+                try:
+                    dst.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+        threading.Thread(target=pump, args=(conn, vsock), daemon=True).start()
+        pump(vsock, conn)
+    finally:
+        conn.close()
+        if vsock is not None:
+            vsock.close()
+
+
+def serve_broker(sock, job_id, group):
+    sock.settimeout(0.5)
+    events = Path(group) / "cgroup.events"
+    while True:
+        try:
+            if "populated 0" in events.read_text():
+                break
+        except FileNotFoundError:
+            break
+        try:
+            conn, _ = sock.accept()
+        except TimeoutError:
+            continue
+        except OSError:
+            break
+        threading.Thread(target=relay_broker, args=(conn, job_id), daemon=True).start()
+    os._exit(0)
+
+
+def start_broker(job_id, ready_fd):
+    private_broker_mount()
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(BROKER_SOCKET)
+    os.chown(BROKER_SOCKET, 0, 1000)
+    os.chmod(BROKER_SOCKET, 0o660)
+    sock.listen(16)
+    # The listener reports after it has left the job cgroup. A failure here must
+    # stop the job; otherwise the listener would keep the cgroup populated.
+    status_read, status_write = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(status_read)
+        os.close(int(ready_fd))
+        devnull = os.open("/dev/null", os.O_RDWR)
+        os.dup2(devnull, 0)
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        os.close(devnull)
+        try:
+            leave_job_cgroup()
+            os.write(status_write, b"1")
+            os.close(status_write)
+            serve_broker(sock, job_id, str(CGROUP / job_id))
+        except Exception:
+            try:
+                os.write(status_write, b"0")
+            except OSError:
+                pass
+            os._exit(1)
+        os._exit(0)
+    os.close(status_write)
+    sock.close()
+    try:
+        started = os.read(status_read, 1) == b"1"
+    finally:
+        os.close(status_read)
+    if not started:
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            pass
+        raise OSError("broker listener failed")
 
 
 def workspace_path(path):
@@ -57,25 +219,26 @@ def populated(group):
     return "populated 1" in (group / "cgroup.events").read_text()
 
 
-def execute_child(group, cwd, command, ready_fd):
+def execute_child(group, cwd, command, ready_fd, broker_job=None):
     # Enter the cgroup before dropping privileges and before customer code executes.
     (Path(group) / "cgroup.procs").write_text(str(os.getpid()))
+    env = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": "/home/developer",
+        "LANG": "C.UTF-8",
+        "USER": "developer",
+    }
+    if broker_job is not None:
+        # The socket lives in this job's mount namespace. The placeholder is not a secret.
+        start_broker(broker_job, ready_fd)
+        env.update(broker_client_env())
     os.setgroups([])
     os.setgid(1000)
     os.setuid(1000)
     os.chdir(cwd)
     os.write(int(ready_fd), b"1")
     os.close(int(ready_fd))
-    os.execve(
-        "/bin/bash",
-        ["bash", "-lc", command],
-        {
-            "PATH": "/usr/local/bin:/usr/bin:/bin",
-            "HOME": "/home/developer",
-            "LANG": "C.UTF-8",
-            "USER": "developer",
-        },
-    )
+    os.execve("/bin/bash", ["bash", "-lc", command], env)
 
 
 def supervise(job, process, group):
@@ -242,17 +405,17 @@ def handle(op, args):
                 "deadline": time.monotonic() + args["timeout_seconds"],
             }
             ready_read, ready_write = os.pipe()
+            child = [
+                "/usr/bin/python3",
+                __file__,
+                "--job-child",
+            ]
+            if args.get("broker_pipe") is True:
+                child += ["--broker", job_id]
+            child += [str(group), str(cwd), args["command"], str(ready_write)]
             try:
                 process = subprocess.Popen(
-                    [
-                        "/usr/bin/python3",
-                        __file__,
-                        "--job-child",
-                        str(group),
-                        str(cwd),
-                        args["command"],
-                        str(ready_write),
-                    ],
+                    child,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -326,7 +489,12 @@ def reap_orphans():
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--job-child":
-        execute_child(*sys.argv[2:])
+        child_args = sys.argv[2:]
+        broker_job = None
+        if child_args[:1] == ["--broker"]:
+            broker_job = child_args[1]
+            child_args = child_args[2:]
+        execute_child(*child_args, broker_job=broker_job)
         return
     CGROUP.mkdir(exist_ok=True)
     (CGROUP / "cgroup.subtree_control").write_text("+pids")

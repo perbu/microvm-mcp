@@ -307,8 +307,9 @@ connections itself.
 
 Requests pass the same host allowlist, no-`Origin`, bearer and ownership checks as
 the tools. Refusals happen before any guest connection: 401 for credentials, 404
-for another workspace's VM, 403 for port 1024 (the guest supervisor) or ports
-outside `stream_ports`, 409 for a full stream quota or no guest listener. Opening
+for another workspace's VM, 403 for port 1023 (the job broker pipe), port 1024
+(the guest supervisor), or ports outside `stream_ports`, 409 for a full stream
+quota or no guest listener. Opening
 a stream wakes a suspended VM. Binary messages carry bytes; text messages are
 sent as their UTF-8 bytes. Client messages are limited to 1 MiB.
 
@@ -327,7 +328,7 @@ sent as their UTF-8 bytes. Client messages are limited to 1 MiB.
 - **Limits.** Configure them in the service TOML (defaults shown):
 
   ```toml
-  stream_ports = [[1025, 65535]]   # inclusive ranges; [] disables streams; 1024 is refused
+  stream_ports = [[1025, 65535]]   # inclusive ranges; [] disables streams; 1023 and 1024 are refused
   max_streams = 32                 # host-wide
   max_streams_per_workspace = 8
   max_streams_per_vm = 4
@@ -353,6 +354,75 @@ microvm-mcp attach ... --port 5002 --ignore-stdin-eof < /dev/null > out.bin
 ```
 
 It exits 0 when the guest closes normally and 1 on refusal or any other close.
+
+## Job broker pipe
+
+`vm_exec` accepts an optional `broker_pipe_token`: a one-time unguessable token
+(`secrets.token_urlsafe(32)` or another 43–128 character `[A-Za-z0-9_-]` value).
+The service stores only its SHA-256, in memory. The token is not written to
+receipts, VM status, logs, or the guest, and a retried `request_id` does not
+replace the hash. The guest is told `broker_pipe: true` and the job id. The
+response adds `"broker_pipe": true`.
+
+For that job the guest supervisor listens on `/run/fa-broker/broker.sock` inside
+a mount namespace private to the job, mode `0660` and group 1000, so uid 1000 in
+that namespace can connect and other jobs cannot see the socket. The job
+environment is the workspace broker client, with a non-secret placeholder
+capability and no storage credentials:
+
+```text
+FA_WORKSPACE_BACKEND=broker
+FA_WORKSPACE_BROKER_URL=http://127.0.0.1/v1/call
+FA_WORKSPACE_BROKER_CAPABILITY=fa-broker-placeholder
+FA_WORKSPACE_MAX_OBJECT_BYTES=67108864
+```
+
+`FA_WORKSPACE_SCOPE` is unset. The HTTP target is `POST /v1/call` on
+`/run/fa-broker/broker.sock`. Guest networking stays off. A client that opens
+that socket and writes the broker request, including the placeholder bearer
+token, is carried to the host unchanged.
+
+Each accepted socket is forwarded to the host on Firecracker's guest-to-host
+vsock `<uds_path>_1023` (port 1023). The first line is the 32-hex job id; the
+rest is raw bytes. Port 1023 is not a public stream and is not served at
+`/v1/vms/{vm_id}/streams/{port}`.
+
+The controller that knows the token attaches:
+
+```text
+GET /v1/vms/{vm_id}/jobs/{job_id}/broker   (WebSocket upgrade)
+Authorization: Bearer <workspace credential>
+X-Broker-Pipe: <broker_pipe_token>
+```
+
+The same host allowlist, no-`Origin`, and bearer checks apply. A wrong token,
+another workspace, an unknown job, or a VM without this pipe is 404. A second
+concurrent attach is 409. WebSocket messages are binary. The payload is a byte
+stream of big-endian frames, which a message may split or combine:
+
+| Kind | `type` | Layout |
+| --- | --- | --- |
+| open | 1 | `u8 type, u32 conn_id` |
+| data | 2 | `u8 type, u32 conn_id, u32 length, payload` with `length <= 65536` |
+| close | 3 | `u8 type, u32 conn_id` |
+
+`conn_id` is nonzero. The service assigns it and sends `open` when a guest
+connection arrives. The controller sends `data` and `close` only. The service
+copies bytes and does not interpret them. The controller splices its end to the
+local broker and replaces `Authorization: Bearer fa-broker-placeholder` with the
+session capability. That splice stays outside this service.
+
+An open pipe counts as activity, so idle suspension waits for it. Manual suspend
+refuses with `busy` unless `force=true`. Suspend and destroy close the pipe with
+WebSocket code 1001 and reason `suspended` or `destroyed`. Credentials are
+rechecked every 5 seconds; revocation or expiry closes it with 1008. Close and
+open are logged with workspace, VM, job, duration, byte counts, and reason,
+never the token or payload. The hash does not survive a service restart.
+
+**Upgrade note:** existing guest images ignore `broker_pipe` until the image is
+rebuilt and its digest is pinned. Restarting the host service does not upgrade a
+running guest or a restored checkpoint. Old images keep working; they just do
+not open the socket.
 
 ## Suspension and failure semantics
 

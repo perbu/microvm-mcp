@@ -130,8 +130,8 @@ def main():
                 create_app(service, hosts),
                 host="127.0.0.1",
                 port=port,
-                # Open streams hold connections; keep 64 for ordinary requests.
-                limit_concurrency=64 + service.max_streams,
+                # Open streams and broker pipes hold connections; keep 64 for requests.
+                limit_concurrency=64 + service.max_streams + service.max_vms * 4,
                 ws="websockets-sansio",
                 ws_max_size=MAX_FRAME,
                 timeout_keep_alive=5,

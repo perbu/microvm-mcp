@@ -1,5 +1,6 @@
 import concurrent.futures
 import socket
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -25,8 +26,11 @@ class Backend:
 
     def __init__(self):
         self.calls = []
+        self.exec_args = []
         self.active = False
         self.jobs = {}
+        self.broker_paths = {}
+        self._broker_dir = tempfile.TemporaryDirectory()
 
     def create(self, vm):
         self.calls.append(("create", vm["id"]))
@@ -49,9 +53,20 @@ class Backend:
             return {"active": self.active, "jobs": self.jobs}
         if op == "exec":
             self.active = True
+            self.exec_args.append(args)
             self.jobs[args["job_id"]] = {"state": "running"}
             return {"job_id": args["job_id"]}
         return {"ok": True}
+
+    def broker_listen(self, vm):
+        self.calls.append(("listen_broker", vm["id"]))
+        path = Path(self._broker_dir.name) / f"{vm['id']}.sock"
+        path.unlink(missing_ok=True)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(str(path))
+        sock.listen(16)
+        self.broker_paths[vm["id"]] = path
+        return sock
 
     def connect(self, vm, port):
         # A canned echo peer, not a guest: greets, echoes, closes after EOF.

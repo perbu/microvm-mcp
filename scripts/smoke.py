@@ -578,10 +578,11 @@ print("calculated 20 Fibonacci numbers", file=sys.stderr)
                     return exc.response.status_code
                 raise AssertionError(f"stream to port {port} accepted")
 
+            assert refused(token, 1023) == 403
             assert refused(token, 1024) == 403
             assert refused(other, 5000) == 404
             assert refused(token, 5099) == 409
-            check("control port, other workspace and closed guest port refused")
+            check("broker port, control port, other workspace and closed guest port refused")
             with connect(
                 stream_url(endpoint, vm, 5000),
                 additional_headers={"Authorization": f"Bearer {token}"},
