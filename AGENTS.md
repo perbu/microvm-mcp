@@ -35,9 +35,13 @@ arguments only choose among them. VMs keep private kernel/disk copies, so resume
 must never depend on an image still being configured. Guest streams are host to
 guest only, refuse ports 1023 and 1024, close on any suspension, and log
 metadata only, never payload. Port 1023 is the job broker pipe: the token is
-hashed in memory only and is not a guest, receipt, or log field. Firecracker's
-vsock bridge has no host half-close; the smoke test asserts this, so revisit
-the EOF contract if it starts failing.
+hashed in memory only and is not a guest, receipt, or log field. Any guest
+process can dial port 1023, so the host routes only on the job's route secret,
+never the job id alone. The guest listener stays in a cgroup under the jobs
+cgroup, runs as nobody, and accepts only peers in its job's cgroup. Broker
+pumps stay non-blocking on the event loop, with bounded buffers. Firecracker's
+vsock bridge has no host half-close and does not forward a guest half-close;
+the smoke test asserts both, so revisit the EOF contracts if it starts failing.
 
 ## Suspension and clocks
 

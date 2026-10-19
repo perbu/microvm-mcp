@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from websockets.exceptions import InvalidStatus
 from websockets.sync.client import connect
 
 from microvm_mcp.attach import attach, stream_url
+from microvm_mcp.broker import CLOSE, DATA, OPEN, Parser, encode
 from microvm_mcp.cli import stream_settings
 from microvm_mcp.errors import ServiceError
 from microvm_mcp.firecracker import Firecracker
@@ -116,6 +118,51 @@ def serve_http(service):
             raise AssertionError("HTTP server did not start")
         time.sleep(0.01)
     return f"http://{host}", server, thread
+
+
+# The broker job: shows its environment, waits for the probe, then makes one
+# request with a half-close. The reply must still arrive.
+BROKER_CLIENT = b"""import os, socket, time
+print(sorted(k for k in os.environ if k.startswith("FA_")), flush=True)
+print(os.environ["FA_WORKSPACE_BROKER_CAPABILITY"], flush=True)
+open("broker.pid", "w").write(str(os.getpid()))
+deadline = time.monotonic() + 60
+while not os.path.exists("broker.go") and time.monotonic() < deadline:
+    time.sleep(0.05)
+client = socket.socket(socket.AF_UNIX)
+client.connect("/run/fa-broker/broker.sock")
+client.sendall(b"ping")
+client.shutdown(socket.SHUT_WR)
+reply = b""
+while chunk := client.recv(65536):
+    reply += chunk
+print(reply.decode(), flush=True)
+"""
+# Another job of the same VM and uid: it must not reach the broker job's pipe.
+BROKER_PROBE = b"""import os, socket, sys
+job_id = sys.argv[1]
+
+def refused(sock):
+    try:
+        return sock.recv(1) == b""
+    except ConnectionResetError:
+        return True
+
+print("hidden", not os.path.exists("/run/fa-broker/broker.sock"))
+pid = open("broker.pid").read()
+try:
+    via_proc = socket.socket(socket.AF_UNIX)
+    via_proc.connect(f"/proc/{pid}/root/run/fa-broker/broker.sock")
+    via_proc.sendall(b"steal")
+    print("proc-root", refused(via_proc))
+except OSError:
+    print("proc-root", True)
+forged = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+forged.connect((socket.VMADDR_CID_HOST, 1023))
+forged.sendall(job_id.encode() + b"0" * 64 + b"\\n" + b"steal")
+print("forged", refused(forged))
+open("broker.go", "w").close()
+"""
 
 
 def main():
@@ -602,6 +649,65 @@ print("calculated 20 Fibonacci numbers", file=sys.stderr)
             check("stream closed by hibernation; guest listener reachable after resume")
             for listener in listeners:
                 call("vm_job_cancel", vm_id=vm, **listener)
+            for name, data in (("broker_client.py", BROKER_CLIENT), ("probe.py", BROKER_PROBE)):
+                call(
+                    "vm_write_file",
+                    vm_id=vm,
+                    path=name,
+                    data_base64=base64.b64encode(data).decode(),
+                )
+            execute(vm, "rm -f broker.pid broker.go")
+            pipe_token = secrets.token_urlsafe(32)
+            broker_job = call(
+                "vm_exec",
+                vm_id=vm,
+                request_id=uuid.uuid4().hex,
+                command="python3 -u broker_client.py",
+                timeout_seconds=120,
+                broker_pipe_token=pipe_token,
+            )
+            assert broker_job["broker_pipe"] is True, "rebuild and pin the guest image"
+            job_id = broker_job["job_id"]
+            url = stream_url(endpoint, vm, 0).replace("/streams/0", f"/jobs/{job_id}/broker")
+            with connect(
+                url,
+                additional_headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Broker-Pipe": pipe_token,
+                },
+                open_timeout=30,
+            ) as ws:
+                deadline = time.monotonic() + 10
+                while True:
+                    try:
+                        call("vm_read_file", vm_id=vm, path="broker.pid")
+                        break
+                    except ServiceError:
+                        assert time.monotonic() < deadline, "broker job did not start"
+                        time.sleep(0.05)
+                probe = execute(vm, f"python3 -u probe.py {job_id}").split("\n")
+                assert probe[:3] == ["hidden True", "proc-root True", "forged True"], probe
+                parser = Parser()
+                frames = []
+                while len(frames) < 2:
+                    frames += parser.feed(ws.recv(timeout=30))
+                (kind, conn_id, _), data = frames[0], frames[1]
+                # Only the broker job's own connection arrives; nothing forged.
+                assert kind == OPEN and data == (DATA, conn_id, b"ping"), frames
+                ws.send(encode(DATA, conn_id, b"pong") + encode(CLOSE, conn_id))
+                # Status polling refreshes the job, which retires its finished pipe.
+                deadline = time.monotonic() + 30
+                while call("vm_job_status", vm_id=vm, job_id=job_id)["state"] != "completed":
+                    assert time.monotonic() < deadline, "broker job did not finish"
+                    time.sleep(0.1)
+                for _ in ws:
+                    pass
+                assert (ws.close_code, ws.close_reason) == (1001, "job finished")
+            output = call("vm_job_output", vm_id=vm, job_id=job_id)
+            lines = output["stdout"].split("\n")
+            assert lines[1:3] == ["fa-broker-placeholder", "pong"], output
+            assert "FA_WORKSPACE_SCOPE" not in lines[0], output
+            check("broker pipe: half-closed request answered; other jobs and forged routes refused")
         finally:
             http_server.should_exit = True
             http_thread.join(10)

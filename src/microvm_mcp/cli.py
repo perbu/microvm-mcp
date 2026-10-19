@@ -99,6 +99,7 @@ def main():
     else:
         import uvicorn
 
+        from .broker import MAX_ATTACHED
         from .firecracker import Firecracker
         from .server import MAX_FRAME, create_app
         from .service import Service
@@ -131,7 +132,7 @@ def main():
                 host="127.0.0.1",
                 port=port,
                 # Open streams and broker pipes hold connections; keep 64 for requests.
-                limit_concurrency=64 + service.max_streams + service.max_vms * 4,
+                limit_concurrency=64 + service.max_streams + service.max_vms * MAX_ATTACHED,
                 ws="websockets-sansio",
                 ws_max_size=MAX_FRAME,
                 timeout_keep_alive=5,

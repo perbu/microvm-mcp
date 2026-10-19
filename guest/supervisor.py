@@ -10,6 +10,7 @@ import select
 import selectors
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -30,6 +31,11 @@ LIFECYCLE_PROTOCOL = 1
 BROKER_PORT = 1023
 BROKER_SOCKET = "/run/fa-broker/broker.sock"
 BROKER_PLACEHOLDER = "fa-broker-placeholder"
+# The listener runs as nobody: job processes (uid 1000) cannot read its route secret.
+BROKER_UID = 65534
+BROKER_RELAYS = 32  # Concurrent guest connections; each relay uses two threads.
+BROKER_PIDS = 2 * BROKER_RELAYS + 16
+HEXDIGITS = frozenset("0123456789abcdef")
 CLONE_NEWNS = 0x00020000
 MS_REC = 16384
 MS_PRIVATE = 1 << 18
@@ -77,15 +83,44 @@ def private_broker_mount():
     _mount_private(b"/run/fa-broker", b"tmpfs", b"tmpfs", 0, b"mode=755")
 
 
-def leave_job_cgroup():
-    """Move this process back beside PID 1 so it does not keep the job cgroup busy."""
-    line = Path("/proc/1/cgroup").read_text().strip().splitlines()[-1]
-    relative = line.split(":", 2)[-1].lstrip("/")
-    (Path("/sys/fs/cgroup") / relative / "cgroup.procs").write_text(str(os.getpid()))
+def kill_group(group):
+    try:
+        (Path(group) / "cgroup.kill").write_text("1")
+    except FileNotFoundError:
+        pass
 
 
-def relay_broker(conn, job_id):
-    """Forward one guest socket to the host. The first line is the job id."""
+def broker_group(job_id):
+    # A sibling under CGROUP: freezing jobs freezes it, and it never keeps the job busy.
+    return CGROUP / f"{job_id}-broker"
+
+
+def is_hex(value, length):
+    return isinstance(value, str) and len(value) == length and HEXDIGITS.issuperset(value)
+
+
+def broker_preamble(job_id, route):
+    """First bytes on host port 1023. The host matches the route to the job's pipe."""
+    return job_id.encode() + route.encode() + b"\n"
+
+
+def job_cgroup_line(group):
+    return "0::/" + str(Path(group).relative_to(CGROUP.parent))
+
+
+def peer_in_group(conn, group):
+    """Only this job's processes may use its socket, even via /proc/<pid>/root."""
+    size = struct.calcsize("3i")
+    pid, _, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, size))
+    try:
+        text = Path(f"/proc/{pid}/cgroup").read_text()
+    except OSError:
+        return False
+    return text.strip() == job_cgroup_line(group)
+
+
+def relay_broker(conn, job_id, route, slots):
+    """Forward one guest socket to the host after the job id and route secret."""
     vsock = None
     delay = 0.05
     deadline = time.monotonic() + 30
@@ -103,7 +138,7 @@ def relay_broker(conn, job_id):
                 delay = min(delay * 2, 0.5)
         if vsock is None:
             return
-        vsock.sendall(job_id.encode() + b"\n")
+        vsock.sendall(broker_preamble(job_id, route))
 
         def pump(src, dst):
             try:
@@ -123,11 +158,13 @@ def relay_broker(conn, job_id):
         conn.close()
         if vsock is not None:
             vsock.close()
+        slots.release()
 
 
-def serve_broker(sock, job_id, group):
+def serve_broker(sock, job_id, route, group):
     sock.settimeout(0.5)
     events = Path(group) / "cgroup.events"
+    slots = threading.BoundedSemaphore(BROKER_RELAYS)
     while True:
         try:
             if "populated 0" in events.read_text():
@@ -140,41 +177,54 @@ def serve_broker(sock, job_id, group):
             continue
         except OSError:
             break
-        threading.Thread(target=relay_broker, args=(conn, job_id), daemon=True).start()
+        if not peer_in_group(conn, group) or not slots.acquire(blocking=False):
+            conn.close()
+            continue
+        threading.Thread(
+            target=relay_broker, args=(conn, job_id, route, slots), daemon=True
+        ).start()
     os._exit(0)
 
 
-def start_broker(job_id, ready_fd):
+def run_listener(sock, job_id, route, ready_fd, status_write):
+    os.close(int(ready_fd))
+    devnull = os.open("/dev/null", os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    os.close(devnull)
+    (broker_group(job_id) / "cgroup.procs").write_text(str(os.getpid()))
+    os.setgroups([])
+    os.setgid(BROKER_UID)
+    os.setuid(BROKER_UID)
+    os.write(status_write, b"1")
+    os.close(status_write)
+    serve_broker(sock, job_id, route, CGROUP / job_id)
+
+
+def start_broker(job_id, route, ready_fd):
     private_broker_mount()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(BROKER_SOCKET)
     os.chown(BROKER_SOCKET, 0, 1000)
     os.chmod(BROKER_SOCKET, 0o660)
     sock.listen(16)
-    # The listener reports after it has left the job cgroup. A failure here must
-    # stop the job; otherwise the listener would keep the cgroup populated.
+    # Double fork: PID 1 adopts and reaps the listener, never the customer's shell.
+    # A failure here must stop the job before customer code runs.
     status_read, status_write = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        os.close(status_read)
-        os.close(int(ready_fd))
-        devnull = os.open("/dev/null", os.O_RDWR)
-        os.dup2(devnull, 0)
-        os.dup2(devnull, 1)
-        os.dup2(devnull, 2)
-        os.close(devnull)
+    middle = os.fork()
+    if middle == 0:
         try:
-            leave_job_cgroup()
-            os.write(status_write, b"1")
-            os.close(status_write)
-            serve_broker(sock, job_id, str(CGROUP / job_id))
-        except Exception:
+            os.close(status_read)
+            if os.fork() == 0:
+                run_listener(sock, job_id, route, ready_fd, status_write)
+        except BaseException:
             try:
                 os.write(status_write, b"0")
             except OSError:
                 pass
             os._exit(1)
         os._exit(0)
+    os.waitpid(middle, 0)
     os.close(status_write)
     sock.close()
     try:
@@ -182,10 +232,7 @@ def start_broker(job_id, ready_fd):
     finally:
         os.close(status_read)
     if not started:
-        try:
-            os.kill(pid, 9)
-        except ProcessLookupError:
-            pass
+        kill_group(broker_group(job_id))
         raise OSError("broker listener failed")
 
 
@@ -219,7 +266,7 @@ def populated(group):
     return "populated 1" in (group / "cgroup.events").read_text()
 
 
-def execute_child(group, cwd, command, ready_fd, broker_job=None):
+def execute_child(group, cwd, command, ready_fd, broker=None):
     # Enter the cgroup before dropping privileges and before customer code executes.
     (Path(group) / "cgroup.procs").write_text(str(os.getpid()))
     env = {
@@ -228,9 +275,15 @@ def execute_child(group, cwd, command, ready_fd, broker_job=None):
         "LANG": "C.UTF-8",
         "USER": "developer",
     }
-    if broker_job is not None:
-        # The socket lives in this job's mount namespace. The placeholder is not a secret.
-        start_broker(broker_job, ready_fd)
+    if broker is not None:
+        # The socket lives in this job's mount namespace. The placeholder is not a secret;
+        # the route secret arrives on a pipe, never argv, and stays with the listener.
+        job_id, route_fd = broker
+        with os.fdopen(int(route_fd), "rb") as source:
+            route = source.read(65).decode()
+        if not is_hex(route, 64):
+            raise ValueError("bad broker route")
+        start_broker(job_id, route, ready_fd)
         env.update(broker_client_env())
     os.setgroups([])
     os.setgid(1000)
@@ -267,6 +320,9 @@ def supervise(job, process, group):
             process.poll()  # reap the main child; descendants still count as activity
             if not populated(group) and not selector.get_map():
                 break
+        if job["broker_group"] is not None:
+            # The listener also exits on its own once the job group empties.
+            kill_group(job["broker_group"])
         with LOCK:
             job["exit_code"] = process.wait()
             job["state"] = "completed"
@@ -384,6 +440,9 @@ def handle(op, args):
                 raise ValueError("bad job id")
             if job_id in JOBS:
                 return {"job_id": job_id}
+            broker = args.get("broker_pipe") is True
+            if broker and not is_hex(args.get("broker_route"), 64):
+                raise ValueError("bad broker route")
             if len(JOBS) >= 256 or sum(j["state"] == "running" for j in JOBS.values()) >= 4:
                 raise ValueError("job quota exceeded")
             parts = workspace_path(args.get("cwd", "."))
@@ -393,6 +452,11 @@ def handle(op, args):
             group = CGROUP / job_id
             group.mkdir()
             (group / "pids.max").write_text("128")
+            relay_group = None
+            if broker:
+                relay_group = broker_group(job_id)
+                relay_group.mkdir()
+                (relay_group / "pids.max").write_text(str(BROKER_PIDS))
             job = {
                 "state": "running",
                 "exit_code": None,
@@ -403,15 +467,20 @@ def handle(op, args):
                 "eof": set(),
                 "group": group,
                 "deadline": time.monotonic() + args["timeout_seconds"],
+                "broker_group": relay_group,
             }
             ready_read, ready_write = os.pipe()
+            route_read = -1
             child = [
                 "/usr/bin/python3",
                 __file__,
                 "--job-child",
             ]
-            if args.get("broker_pipe") is True:
-                child += ["--broker", job_id]
+            if broker:
+                route_read, route_write = os.pipe()
+                os.write(route_write, args["broker_route"].encode())
+                os.close(route_write)
+                child += ["--broker", job_id, str(route_read)]
             child += [str(group), str(cwd), args["command"], str(ready_write)]
             try:
                 process = subprocess.Popen(
@@ -421,13 +490,15 @@ def handle(op, args):
                     stderr=subprocess.PIPE,
                     start_new_session=True,
                     close_fds=True,
-                    pass_fds=(ready_write,),
+                    pass_fds=[fd for fd in (ready_write, route_read) if fd != -1],
                 )
                 os.close(ready_write)
                 ready_write = -1
                 if not select.select([ready_read], [], [], 2)[0] or os.read(ready_read, 1) != b"1":
                     process.kill()
-                    (group / "cgroup.kill").write_text("1")
+                    kill_group(group)
+                    if relay_group is not None:
+                        kill_group(relay_group)
                     process.wait()
                     process.stdout.close()
                     process.stderr.close()
@@ -436,9 +507,13 @@ def handle(op, args):
                 os.close(ready_read)
                 if ready_write != -1:
                     os.close(ready_write)
+                if route_read != -1:
+                    os.close(route_read)
             MANAGED_PIDS.add(process.pid)
             JOBS[job_id] = job
             threading.Thread(target=supervise, args=(job, process, group), daemon=True).start()
+            if broker:
+                return {"job_id": job_id, "broker_pipe": True}
             return {"job_id": job_id}
         if op in ("job_status", "job_output", "job_cancel"):
             job = JOBS[args["job_id"]]
@@ -490,11 +565,11 @@ def reap_orphans():
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--job-child":
         child_args = sys.argv[2:]
-        broker_job = None
+        broker = None
         if child_args[:1] == ["--broker"]:
-            broker_job = child_args[1]
-            child_args = child_args[2:]
-        execute_child(*child_args, broker_job=broker_job)
+            broker = (child_args[1], child_args[2])
+            child_args = child_args[3:]
+        execute_child(*child_args, broker=broker)
         return
     CGROUP.mkdir(exist_ok=True)
     (CGROUP / "cgroup.subtree_control").write_text("+pids")

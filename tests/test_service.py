@@ -31,6 +31,8 @@ class Backend:
         self.jobs = {}
         self.broker_paths = {}
         self._broker_dir = tempfile.TemporaryDirectory()
+        self.broker_support = True
+        self.exec_error = None
 
     def create(self, vm):
         self.calls.append(("create", vm["id"]))
@@ -52,9 +54,13 @@ class Backend:
         if op == "status":
             return {"active": self.active, "jobs": self.jobs}
         if op == "exec":
+            if self.exec_error is not None:
+                raise self.exec_error
             self.active = True
             self.exec_args.append(args)
             self.jobs[args["job_id"]] = {"state": "running"}
+            if args.get("broker_pipe") and self.broker_support:
+                return {"job_id": args["job_id"], "broker_pipe": True}
             return {"job_id": args["job_id"]}
         return {"ok": True}
 
