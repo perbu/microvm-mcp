@@ -117,8 +117,9 @@ substitute for storage isolation from unrelated host services.
 
 ```sh
 uv sync --locked
-# Docker and mkfs.ext4 are needed only to build the image. Preserve guest UIDs.
-sudo scripts/build-image /var/lib/microvm-images
+# Docker, mkfs.ext4 >= 1.47.1 and debugfs are needed only to build the image.
+# No root: ownership comes from the export, and the script checks it.
+scripts/build-image /var/lib/microvm-images
 sudo install -d -m 0700 /var/lib/microvm-mcp
 ```
 

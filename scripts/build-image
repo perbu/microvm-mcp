@@ -15,11 +15,28 @@ trap cleanup EXIT
 docker build -t microvm-mcp-debian:13 "$here/guest"
 container=$(docker create microvm-mcp-debian:13)
 docker export "$container" -o "$stage/rootfs.tar"
-mkdir "$stage/root"
-# Run as root to preserve guest UID 1000. Never extract an untrusted guest export.
-tar --numeric-owner -xf "$stage/rootfs.tar" -C "$stage/root"
+# mke2fs >= 1.47.1 reads ownership and modes from the tarball itself, so no root
+# is needed. Extracting as a non-root user would hand every file to the builder,
+# and builder UID 1000 is the guest's job user. Never use an untrusted export.
 truncate -s 3G "$output/debian-13.ext4"
-mkfs.ext4 -q -F -d "$stage/root" "$output/debian-13.ext4"
+mkfs.ext4 -q -F -d "$stage/rootfs.tar" "$output/debian-13.ext4"
+# The root supervisor executes these; a job-writable copy would be a guest root escape.
+for path in /opt/microvm/supervisor.py /sbin/microvm-init /usr/bin/python3 /etc; do
+    owner=$(debugfs -R "stat $path" "$output/debian-13.ext4" 2>/dev/null |
+        sed -n 's/.*User: *\([0-9]*\).*/\1/p')
+    if [ "$owner" != 0 ]; then
+        echo "build-image: $path is owned by uid ${owner:-?}, not root" >&2
+        rm -f "$output/debian-13.ext4"
+        exit 1
+    fi
+done
+owner=$(debugfs -R "stat /workspace" "$output/debian-13.ext4" 2>/dev/null |
+    sed -n 's/.*User: *\([0-9]*\).*/\1/p')
+if [ "$owner" != 1000 ]; then
+    echo "build-image: /workspace is owned by uid ${owner:-?}, not 1000" >&2
+    rm -f "$output/debian-13.ext4"
+    exit 1
+fi
 sha256sum "$output/debian-13.ext4" > "$output/debian-13.ext4.sha256"
 docker image inspect microvm-mcp-debian:13 --format '{{.Id}}' > "$output/image-build-id"
 echo "Built Debian image in $output; pin its digest in service.toml."
