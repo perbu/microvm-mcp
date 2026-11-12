@@ -1,7 +1,9 @@
 import argparse
 import fcntl
+import ipaddress
 import logging
 import os
+import socket
 import sys
 import tomllib
 from pathlib import Path
@@ -23,6 +25,43 @@ def stream_settings(config):
     return {key: config[key] for key in keys if key in config}
 
 
+def listen_addresses(config):
+    """Validated `listen` IP literals; loopback unless the operator opts in."""
+    addresses = config.get("listen", ["127.0.0.1"])
+    if not isinstance(addresses, list) or not addresses:
+        raise ValueError("listen must be a non-empty list of IP addresses")
+    parsed = []
+    for text in addresses:
+        if not isinstance(text, str):
+            raise ValueError(f"listen entry is not an IP address string: {text!r}")
+        address = ipaddress.ip_address(text)
+        if address in parsed:
+            raise ValueError(f"listen address repeated: {text}")
+        parsed.append(address)
+    return parsed
+
+
+def listen_sockets(config):
+    """Bind one TCP socket per listen address. IPv6 sockets are IPv6-only, so
+    0.0.0.0 and :: can be listed together regardless of net.ipv6.bindv6only."""
+    port = config.get("port", 8090)
+    sockets = []
+    try:
+        for address in listen_addresses(config):
+            family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sockets.append(sock)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sock.bind((str(address), port))
+    except BaseException:
+        for sock in sockets:
+            sock.close()
+        raise
+    return sockets
+
+
 def main():
     parser = argparse.ArgumentParser(description="Standalone development microVM service")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -36,7 +75,12 @@ def main():
     issue.add_argument("--max-vms", type=int, default=1)
     issue.add_argument("--max-memory-mib", type=int, default=2048)
     issue.add_argument("--max-vcpus", type=int, default=2)
-    issue.add_argument("--allow-network", action="store_true")
+    issue.add_argument("--allow-network", action="store_true", help="Full public IPv4 egress")
+    issue.add_argument(
+        "--allow-packages",
+        action="store_true",
+        help="network=packages: only the operator-configured package mirrors",
+    )
     issue.add_argument(
         "--image",
         action="append",
@@ -83,6 +127,7 @@ def main():
                 max_memory_mib=args.max_memory_mib,
                 max_vcpus=args.max_vcpus,
                 network=args.allow_network,
+                packages=args.allow_packages,
                 images=args.images,
             )
             output.write(token + "\n")
@@ -106,6 +151,7 @@ def main():
 
         logging.basicConfig(level=logging.INFO)
         config = tomllib.loads(args.config.read_text())
+        listen_addresses(config)  # fail on a malformed listen list before preflight
         store = Store(config["state_dir"])
         with (store.directory / "service.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -126,19 +172,24 @@ def main():
                     backend.network.destroy(vm)
             port = config.get("port", 8090)
             hosts = config.get("allowed_hosts", [f"127.0.0.1:{port}", f"localhost:{port}"])
-            # Remote access goes through a TLS reverse proxy. Never bind cleartext remotely.
-            uvicorn.run(
-                create_app(service, hosts),
-                host="127.0.0.1",
-                port=port,
-                # Open streams and broker pipes hold connections; keep 64 for requests.
-                limit_concurrency=64 + service.max_streams + service.max_vms * MAX_ATTACHED,
-                ws="websockets-sansio",
-                ws_max_size=MAX_FRAME,
-                timeout_keep_alive=5,
-                access_log=False,
-                proxy_headers=False,
+            # Loopback by default. A non-loopback `listen` serves cleartext HTTP, and
+            # bearer tokens with it; prefer a TLS reverse proxy for remote clients.
+            sockets = listen_sockets(config)
+            server = uvicorn.Server(
+                uvicorn.Config(
+                    create_app(service, hosts),
+                    # Open streams and broker pipes hold connections; keep 64 for requests.
+                    limit_concurrency=64 + service.max_streams + service.max_vms * MAX_ATTACHED,
+                    ws="websockets-sansio",
+                    ws_max_size=MAX_FRAME,
+                    timeout_keep_alive=5,
+                    access_log=False,
+                    proxy_headers=False,
+                )
             )
+            for sock in sockets:
+                logging.info("listening on %s", sock.getsockname()[:2])
+            server.run(sockets=sockets)
 
 
 if __name__ == "__main__":

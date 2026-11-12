@@ -31,7 +31,7 @@ from microvm_mcp.broker import CLOSE, DATA, OPEN, Parser, encode
 from microvm_mcp.cli import stream_settings
 from microvm_mcp.errors import ServiceError
 from microvm_mcp.firecracker import Firecracker
-from microvm_mcp.network import names
+from microvm_mcp.network import gateway, names
 from microvm_mcp.server import MAX_FRAME, create_app
 from microvm_mcp.service import Service
 from microvm_mcp.store import Store
@@ -170,6 +170,11 @@ def main():
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--network", action="store_true", help="also require public egress")
     parser.add_argument(
+        "--packages",
+        action="store_true",
+        help="also require network=packages installs through the configured [packages] mirrors",
+    )
+    parser.add_argument(
         "--clock-suspend-seconds",
         type=float,
         default=5,
@@ -185,9 +190,11 @@ def main():
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     backend = Firecracker(config)
     backend.preflight()
+    if args.packages and not backend.package_mirrors:
+        parser.error("--packages needs a [packages] table in the configuration")
     service = Service(store, backend, max_vms=config.get("max_vms", 16), **stream_settings(config))
     workspace = "smoke-" + uuid.uuid4().hex
-    token = store.issue(workspace, max_vms=3, network=args.network)
+    token = store.issue(workspace, max_vms=3, network=args.network, packages=args.packages)
     other = store.issue(workspace + "-other")
     created = []
     results = []
@@ -486,6 +493,57 @@ print("calculated 20 Fibonacci numbers", file=sys.stderr)
             ]
             assert sum(drops) >= 2, "blocked traffic did not reach host denial rules"
             check("host firewall counters confirm blocked egress")
+        if args.packages:
+            boxed = call(
+                "vm_create",
+                request_id=uuid.uuid4().hex,
+                memory_mib=512,
+                vcpus=1,
+                network="packages",
+            )["id"]
+            created.append(boxed)
+            mirrors = service.vms[boxed]["mirrors"]
+            if "pypi" in mirrors:
+                execute(
+                    boxed,
+                    "python3 -m venv /tmp/venv && "
+                    "/tmp/venv/bin/pip download --no-deps --dest /tmp/pkgs six",
+                    timeout=120,
+                )
+                check("packages: pip download through the PyPI mirror")
+            if "npm" in mirrors:
+                execute(boxed, "cd /tmp && npm pack is-number >/dev/null", timeout=120)
+                check("packages: npm pack through the npm registry mirror")
+            gw = gateway(service.vms[boxed])
+            mirror = next(iter(mirrors.values()))
+            execute(
+                boxed,
+                "! getent hosts example.com && "
+                "! curl -fsS --max-time 3 http://1.1.1.1/ && "
+                "! curl -fsS --max-time 3 http://169.254.169.254/ && "
+                f"! curl -fsS --max-time 3 http://10.232.{service.vms[boxed]['slot']}.1/ && "
+                f"! curl -fsS --max-time 3 http://{gw}:1/ && "
+                f"! curl -fsS --max-time 3 http://{mirror['address']}:{mirror['port']}/",
+                timeout=40,
+            )
+            check("packages: no DNS, public, private, other-port or direct-mirror egress")
+            rules = subprocess.check_output(
+                ["nft", "list", "table", "inet", names(service.vms[boxed])[2]], text=True
+            )
+            assert "masquerade" in rules and "oifname !=" not in rules, rules
+            assert all(f"tcp dport {m['port']}" in rules for m in mirrors.values()), rules
+            check("packages: host table allows only mirror flows")
+            # Hibernation removes the network; resume rebuilds it from the VM's copy.
+            call("vm_suspend", vm_id=boxed)
+            call("vm_resume", vm_id=boxed)
+            probe = (
+                "/tmp/venv/bin/pip download --no-deps --dest /tmp/pkgs2 six"
+                if "pypi" in mirrors
+                else "cd /tmp && npm pack is-number >/dev/null"
+            )
+            execute(boxed, probe, timeout=120)
+            call("vm_destroy", vm_id=boxed)
+            check("packages: mirror access survives hibernate/resume")
         image_ids = sorted(backend.images)
         probe = "python3 -c 'import os; print(os.statvfs(\"/\").f_fsid)'"
         fsids = {}
@@ -570,6 +628,8 @@ print("calculated 20 Fibonacci numbers", file=sys.stderr)
                         "--port",
                         "5000",
                     ],
+                    # The packaged runner injects the app into sys.path; pass it on.
+                    env={"PYTHONPATH": os.pathsep.join(p for p in sys.path if p)},
                 )
                 async with stdio_client(server) as (read, write):
                     async with ClientSession(read, write) as session:

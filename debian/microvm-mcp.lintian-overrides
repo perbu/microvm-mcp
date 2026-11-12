@@ -2,3 +2,4 @@
 microvm-mcp: unstripped-binary-or-object [usr/lib/microvm-mcp/dependencies/_cffi_backend.cpython-313-x86_64-linux-gnu.so]
 microvm-mcp: unstripped-binary-or-object [usr/lib/microvm-mcp/dependencies/cryptography/hazmat/bindings/_rust.abi3.so]
 microvm-mcp: unstripped-binary-or-object [usr/lib/microvm-mcp/dependencies/rpds/rpds.cpython-313-x86_64-linux-gnu.so]
+microvm-mcp: unstripped-binary-or-object [usr/lib/microvm-mcp/dependencies/websockets/speedups.cpython-313-x86_64-linux-gnu.so]

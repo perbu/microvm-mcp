@@ -361,6 +361,16 @@ class Service:
                     raise ServiceError("quota_exceeded", "Host disk reservation exceeded", 409)
             if args["network"] == "on" and not grant["network"]:
                 raise ServiceError("forbidden", "Workspace cannot enable networking", 403)
+            mirrors = {}
+            if args["network"] == "packages":
+                # Full networking is a superset of mirror-only access.
+                if not (grant["network"] or grant["packages"]):
+                    raise ServiceError("forbidden", "Workspace cannot use package mirrors", 403)
+                mirrors = getattr(self.backend, "package_mirrors", {})
+                if not mirrors:
+                    raise ServiceError(
+                        "invalid_arguments", "No package mirrors are configured", 400
+                    )
             used = {v["slot"] for v in live}
             slot = next(i for i in range(self.max_vms) if i not in used)
             now = time.time()
@@ -376,6 +386,9 @@ class Service:
                 **args,
                 "image": image.id,
             }
+            if mirrors:
+                # The VM keeps its own copy, matching what its guest was booted with.
+                vm["mirrors"] = {k: dict(m) for k, m in mirrors.items()}
             self.vms[vm["id"]] = vm
             self.locks[vm["id"]] = threading.RLock()
             self.store.save_vm(vm)

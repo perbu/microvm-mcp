@@ -164,7 +164,14 @@ def test_create_retries_and_concurrent_quota(env):
 
 @pytest.mark.parametrize(
     "args",
-    [{"owner": "bob"}, {"network": "on"}, {"vcpus": 8}, {"memory_mib": 8192}, {"memory_mib": True}],
+    [
+        {"owner": "bob"},
+        {"network": "on"},
+        {"network": "packages"},
+        {"vcpus": 8},
+        {"memory_mib": 8192},
+        {"memory_mib": True},
+    ],
 )
 def test_no_authority_in_arguments(env, args):
     with pytest.raises(ServiceError):
@@ -237,3 +244,46 @@ def test_uncertain_receipt_not_replayed(env):
     assert service.store.reserve("alice", "exec", "key", {"x": 1}) is None
     with pytest.raises(ServiceError, match="reconciliation"):
         service.store.reserve("alice", "exec", "key", {"x": 1})
+
+
+MIRROR = {"pypi": {"address": "192.168.10.5", "port": 3141, "path": "/simple/"}}
+
+
+@pytest.mark.parametrize("grant", [{}, {"packages": True}, {"network": True}])
+def test_packages_network_needs_a_grant_and_copies_mirrors(tmp_path, grant):
+    store = Store(tmp_path / "state")
+    token = store.issue("alice", **grant)
+    backend = Backend()
+    backend.package_mirrors = MIRROR
+    service = Service(store, backend)
+    args = {"request_id": "p", "network": "packages"}
+    if not grant:
+        with pytest.raises(ServiceError) as failure:
+            service.call(token, "vm_create", args)
+        assert failure.value.status == 403
+        assert not backend.calls
+        return
+    vm = service.call(token, "vm_create", args)
+    assert vm["network"] == "packages"
+    stored = service.vms[vm["id"]]
+    assert stored["mirrors"] == MIRROR and stored["mirrors"] is not MIRROR
+    # A later configuration change does not alter the VM's recorded mirrors.
+    MIRROR["pypi"]["port"] = 9999
+    try:
+        assert store.vms()[0]["mirrors"]["pypi"]["port"] == 3141
+    finally:
+        MIRROR["pypi"]["port"] = 3141
+
+
+def test_packages_network_needs_configured_mirrors(tmp_path):
+    store = Store(tmp_path / "state")
+    token = store.issue("alice", packages=True)
+    backend = Backend()
+    service = Service(store, backend)
+    with pytest.raises(ServiceError, match="No package mirrors"):
+        service.call(token, "vm_create", {"request_id": "p", "network": "packages"})
+    assert not backend.calls
+    # Packages access does not grant the public internet.
+    with pytest.raises(ServiceError) as failure:
+        service.call(token, "vm_create", {"request_id": "q", "network": "on"})
+    assert failure.value.status == 403

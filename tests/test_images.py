@@ -183,6 +183,8 @@ def test_store_migrates_pre_image_workspaces(tmp_path):
     store = Store(directory)
     token = store.issue("old")
     assert store.authenticate(token)["images"] is None
+    assert store.authenticate(token)["packages"] == 0
+    assert store.authenticate(store.issue("pkg", packages=True))["packages"] == 1
     assert store.authenticate(store.issue("new", images=["b", "a", "b"]))["images"] == ["a", "b"]
 
 

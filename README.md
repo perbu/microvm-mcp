@@ -36,6 +36,8 @@ the existing `host_fetch` transport; no harness or demo code changes are require
   the VMM process), resume, automatic idle suspension, and automatic wake on work.
 - Network off by default. Network on adds IPv4 NAT with guest-source enforcement,
   private/metadata destination denial and inbound denial. No guest IPv6 egress.
+  `network="packages"` reaches only operator-configured PyPI/npm mirrors: no DNS
+  and no other egress.
 - Durable metadata and creation/execution retry receipts. A transport-uncertain
   execution is not replayed automatically. `vm_status.jobs` exposes known handles
   for reconciliation; the history is capped at 4096 requests per workspace.
@@ -82,6 +84,8 @@ Provision KVM, cgroup v2, reflink-capable storage and a separately built guest
 kernel/rootfs, then edit `/etc/microvm-mcp.toml` before enabling the service.
 See the [Debian packaging guide](packaging/debian/README.md) for image installation,
 startup, upgrade behavior, runtime maintenance and validation details.
+[INSTALL.md](INSTALL.md) is a step-by-step runbook for building from this tree
+and running it as a boot-enabled systemd service on one host.
 
 ## Kubernetes
 
@@ -99,6 +103,18 @@ The validated target is Linux x86_64 with real `/dev/kvm`, cgroup v2, matching
 Firecracker 1.16 has a vsock pause/resume defect; preflight refuses versions older
 than 1.17. The service currently runs as root to provision jails and networking.
 Keep its listener on loopback; put authenticated remote access behind TLS.
+
+The listener binds `127.0.0.1` by default. `listen` takes a list of IP literals,
+one socket each on `port`; IPv6 sockets are IPv6-only, so list both families for
+all interfaces. A non-loopback listener serves **cleartext HTTP**, bearer tokens
+included, and needs a matching firewall rule and `allowed_hosts` entries for every
+`Host` header clients send (IPv6 literals as `"[addr]:port"`):
+
+```toml
+port = 1050
+listen = ["0.0.0.0", "::"]
+allowed_hosts = ["127.0.0.1:1050", "[::1]:1050", "vms.example.com:1050"]
+```
 
 Install Firecracker/jailer from the operator-verified
 [upstream release](https://github.com/firecracker-microvm/firecracker/releases/tag/v1.17.0).
@@ -163,7 +179,7 @@ Restoring still requires the Firecracker binary the VM was created with. Storage
 reservations use each image's own rootfs size, recorded on the VM. Reserve unused host UIDs starting at `uid_base`, one per VM
 slot. Do not reuse this range for host users or another service instance.
 
-Networking needs operator-enabled IPv4 forwarding and an explicit `uplink`.
+`network=on` needs operator-enabled IPv4 forwarding and an explicit `uplink`.
 The service uses `10.231.<slot>.0/30` and `10.232.<slot>.0/30`; these ranges must not
 overlap existing routes. For each online VM it adds a private network namespace,
 veth/TAP, route, nftables isolation/NAT table and narrowly scoped iptables FORWARD
@@ -181,6 +197,50 @@ sudo .venv/bin/microvm-mcp serve --config /etc/microvm-mcp.toml
 `--image ID` (repeatable) restricts a workspace to those images, the same way
 `--allow-network` grants networking; without it the workspace may use any
 configured image. A refused image returns 403 `forbidden`.
+
+### Package-only networking
+
+`network="packages"` lets a VM install Python and npm packages without any
+other network access. The operator runs pull-through mirrors (for example
+devpi or a pip proxy for PyPI, Verdaccio for npm, or one Nexus/Artifactory
+instance) and lists them in the service configuration:
+
+```toml
+[packages]
+pypi = "http://192.0.2.10:3141/root/pypi/+simple/"
+npm = "http://192.0.2.10:4873/"
+```
+
+Each entry is `http://` with an IPv4 literal and an explicit port. Only `pypi` and
+`npm` are accepted. The guest reaches each mirror at its gateway
+(`10.231.<slot>.1`) on the mirror's port; the VM namespace DNATs that port to the
+mirror. The guest gets no DNS, and the host and namespace both drop every other
+flow, including direct connections to the mirror address. Mirror entries are
+exact exceptions to the private-address and `blocked_cidrs` denials. Mirrors
+need not be reached through `uplink`, and package-only networking does not need
+`uplink`. A mirror elsewhere needs IPv4 forwarding and is masqueraded; one on
+this host does not. It must listen on an address other than loopback; preflight
+checks the route. Plain HTTP is used because no certificate can match the
+gateway address. The mirror itself verifies upstream TLS.
+
+At boot the guest writes `/etc/pip.conf` and `/etc/profile.d/microvm-packages.sh`
+(`PIP_INDEX_URL`, `PIP_TRUSTED_HOST`, `NPM_CONFIG_REGISTRY`), so `pip install`
+in a virtual environment and `npm install` use the mirrors without arguments.
+Images built before this mode ignore the mirror boot arguments, so rebuild the
+image and pin its digest first. Commands still run without root, so system
+packages (`apt`) still belong in the image recipe.
+
+A VM records its mirror list at creation. Hibernate/resume reuses that record,
+and changing `[packages]` affects only new VMs. Grant the mode with
+`issue-token --allow-packages`. `--allow-network` also allows it, because full
+networking is a superset.
+
+Configure each mirror as read-only. A mirror that accepts uploads or account
+creation (Verdaccio's default `npm adduser`/`publish`, devpi user creation) gives
+the agent a way to publish data, and a channel between workspaces that share the
+mirror. For Verdaccio, set `publish: $nobody` and `max_users: -1`; for devpi, use
+`--restrict-modify root`. Downloaded packages still run their own code inside the
+VM; this mode limits where that code can connect, not what it does there.
 
 Issuance is a local administrator action, not an MCP tool. Token files are 0600
 and are never printed. Give the trusted client/broker read access to its token
@@ -564,6 +624,8 @@ sudo .venv/bin/python scripts/smoke.py --config /etc/microvm-mcp.toml --network
 # Longer suspension probes, including jobs with a three-second timeout:
 sudo .venv/bin/python scripts/smoke.py --config /etc/microvm-mcp.toml \
   --network --clock-suspend-seconds 30
+# With a [packages] table and its mirrors running:
+sudo .venv/bin/python scripts/smoke.py --config /etc/microvm-mcp.toml --packages
 ```
 
 The unit suite uses a fake backend that cannot execute code. The separate real
@@ -571,7 +633,10 @@ smoke boots jailed VMs, checks Fibonacci output, separate streams, UTF-8 paginat
 binary output, and output limits, compiles generated C, checks disk isolation, preserves a
 running process across suspension, checks wall time and managed timeouts across
 pause, hibernation, and pause-to-hibernate transitions, checks automatic
-hibernation, verifies network policy, and denies cross-workspace access. For
+hibernation, verifies network policy, and denies cross-workspace access. With
+`--packages` it installs through each configured mirror, checks that DNS, public,
+private, other-port and direct-mirror connections fail, and repeats an install
+after hibernate/resume. For
 every configured image it boots a VM and checks the kernel copy's digest and
 the guest root filesystem's identity across hibernate/resume. With two or more
 images, it checks that a token restricted to one is refused for the other. It runs

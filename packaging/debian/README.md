@@ -95,7 +95,8 @@ after success. Existing bundles are never updated in place. Add its printed
 uses by default with `default = true`. Several images can be installed and
 configured side by side; a top-level `image_id`/`rootfs`/`kernel` configuration
 from earlier releases keeps working as one default image. Then configure quotas, UID range, and
-optional networking. The default listener remains on loopback.
+optional networking. The default listener remains on loopback; `listen` in the
+main README opens other interfaces.
 
 ```sh
 sudo microvm-mcp issue-token --state-dir /var/lib/microvm-mcp \

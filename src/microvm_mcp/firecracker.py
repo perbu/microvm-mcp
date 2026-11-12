@@ -17,7 +17,7 @@ from pathlib import Path
 
 from . import images
 from .errors import ServiceError
-from .network import Network, names
+from .network import Network, gateway, guest_address, mirror_urls, names, package_mirrors
 from .streams import BROKER_PORT, CONTROL_PORT
 
 FICLONE = 0x40049409
@@ -63,6 +63,8 @@ class Firecracker:
         self.network = Network(
             config.get("uplink"), config.get("blocked_cidrs", ()), config.get("uid_base", 62000)
         )
+        # Copied onto each packages-mode VM at creation; resume uses the VM's copy.
+        self.package_mirrors = package_mirrors(config)
         self.processes = {}
         self.diagnostics = {}
         self.uid_base = config.get("uid_base", 62000)
@@ -100,11 +102,23 @@ class Firecracker:
             raise ValueError(f"jail UID {uid} belongs to an existing host account")
         if not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise ValueError("cgroup v2 is required")
-        if (
-            self.config.get("uplink")
-            and Path("/proc/sys/net/ipv4/ip_forward").read_text().strip() != "1"
-        ):
+        forwarding = Path("/proc/sys/net/ipv4/ip_forward").read_text().strip() == "1"
+        if self.config.get("uplink") and not forwarding:
             raise ValueError("networking requires operator-enabled IPv4 forwarding")
+        for mirror in self.package_mirrors.values():
+            # A mirror on this host is local delivery; one elsewhere is forwarded.
+            route = subprocess.run(
+                ["ip", "-o", "route", "get", mirror["address"]],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=15,
+            ).stdout
+            if not route.startswith("local ") and not forwarding:
+                raise ValueError(
+                    f"package mirror {mirror['address']} is not local; "
+                    "enable IPv4 forwarding or host the mirror on this machine"
+                )
         # Verify every operator-pinned image. No implicit latest-image lookup.
         for image in self.images.values():
             for key, path in (("rootfs_sha256", image.rootfs), ("kernel_sha256", image.kernel)):
@@ -249,8 +263,10 @@ class Firecracker:
                 {"vcpu_count": vm["vcpus"], "mem_size_mib": vm["memory_mib"], "smt": False},
             )
             boot = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/sbin/microvm-init"
-            if vm["network"] == "on":
-                boot += f" mvm_ip=10.231.{vm['slot']}.2 mvm_gateway=10.231.{vm['slot']}.1"
+            if vm["network"] != "off":
+                boot += f" mvm_ip={guest_address(vm)} mvm_gateway={gateway(vm)}"
+            for kind, url in mirror_urls(vm).items():
+                boot += f" mvm_{kind}={url}"
             self.api(vm, "PUT", "/boot-source", {"kernel_image_path": "/kernel", "boot_args": boot})
             self.api(
                 vm,
@@ -264,7 +280,7 @@ class Firecracker:
                 },
             )
             self.api(vm, "PUT", "/vsock", {"guest_cid": 3 + vm["slot"], "uds_path": "/guest.sock"})
-            if vm["network"] == "on":
+            if vm["network"] != "off":
                 self.api(
                     vm,
                     "PUT",

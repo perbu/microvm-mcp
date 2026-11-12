@@ -27,11 +27,13 @@ TOOLS = [
     tool(
         "vm_create",
         "Create a private Linux development VM; retry with the same request_id. "
-        "image selects an operator-configured guest image (default when omitted).",
+        "image selects an operator-configured guest image (default when omitted). "
+        "network: off (none), packages (pip/npm through operator mirrors only, no DNS "
+        "or other egress), on (public IPv4 internet).",
         {
             "request_id": KEY,
             "image": IMAGE,
-            "network": {"enum": ["off", "on"], "default": "off"},
+            "network": {"enum": ["off", "packages", "on"], "default": "off"},
             "vcpus": {"type": "integer", "minimum": 1, "maximum": 8, "default": 2},
             "memory_mib": {"type": "integer", "minimum": 256, "maximum": 8192, "default": 1024},
             "idle_seconds": {"type": "integer", "minimum": 0, "maximum": 86400, "default": 300},

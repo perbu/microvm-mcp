@@ -51,6 +51,12 @@ class Store:
             # NULL means any configured image, preserving pre-existing workspaces.
             with self.db:
                 self.db.execute("ALTER TABLE workspaces ADD COLUMN images TEXT")
+        if "packages" not in columns:
+            # Package-mirror access is opt-in; existing workspaces keep their policy.
+            with self.db:
+                self.db.execute(
+                    "ALTER TABLE workspaces ADD COLUMN packages INTEGER NOT NULL DEFAULT 0"
+                )
         os.chmod(self.directory / "state.sqlite", 0o600)
 
     @contextmanager
@@ -67,6 +73,7 @@ class Store:
         max_memory_mib=2048,
         max_vcpus=2,
         network=False,
+        packages=False,
         images=None,
     ):
         if not workspace or len(workspace) > 128 or ttl <= 0:
@@ -87,9 +94,17 @@ class Store:
             # Rotation preserves policy and ownership. It cannot silently widen permissions.
             db.execute(
                 """INSERT OR IGNORE INTO workspaces
-                (id, max_vms, max_memory_mib, max_vcpus, network, revoked, images)
-                VALUES (?, ?, ?, ?, ?, 0, ?)""",
-                (workspace, max_vms, max_memory_mib, max_vcpus, int(network), images),
+                (id, max_vms, max_memory_mib, max_vcpus, network, revoked, images, packages)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?)""",
+                (
+                    workspace,
+                    max_vms,
+                    max_memory_mib,
+                    max_vcpus,
+                    int(network),
+                    images,
+                    int(packages),
+                ),
             )
             db.execute(
                 "INSERT INTO tokens VALUES (?, ?, ?, 0)",

@@ -1,5 +1,42 @@
 # Validation
 
+## Package-only networking — 2026-11-12
+
+- Ruff lint/format and **197 unit tests passed**, no skips, on top of the merged
+  broker pipe (PR #5) with the `listen` setting. New tests cover
+  `[packages]` validation (scheme, IPv4 literal, port, loopback and service ranges,
+  path characters, port collisions), the generated host and namespace rules,
+  iptables INPUT/FORWARD pairs, the `--allow-packages` grant and store migration,
+  and the per-VM mirror copy.
+- The generated rulesets were loaded into real `nft` in an unprivileged
+  user/network namespace that reproduces guest, VM namespace, host and a remote
+  mirror network. A host-local mirror (input) and a remote one with no return
+  route (forward plus masquerade) were reachable at the gateway. Direct mirror
+  addresses, other gateway and mirror ports, other remote ports and the host veth
+  were refused, and with the namespace filter removed the host table alone still
+  refused them.
+- Real Firecracker 1.17.0/KVM smoke with `--network --packages`: **all 40 checks
+  passed**, including the broker-pipe check. Isolated state directory and jail
+  UID range; the installed service was stopped for the run so `--network` could
+  use the `10.231.<slot>` ranges, then restarted. Image `debian-13-dev-v5`, built
+  without root by `scripts/build-image` with the new `guest/init.sh` and the
+  hardened supervisor: rootfs `33559901…10f5`, kernel `e20e46d0…d4f2`. Mirrors
+  were devpi-server 6.21.0 (`--restrict-modify root`, which refused user creation
+  with 403) and Verdaccio 6.11.1 (`publish: $nobody`, `max_users: -1`, which
+  refused `adduser` with 409), as systemd units bound to the host's `docker0`
+  address. They therefore covered the local-mirror path through UFW's INPUT
+  policy DROP, not a mirror on another machine. `pip download` and `npm pack`
+  worked through the mirrors before and after hibernate/resume. DNS, `1.1.1.1`,
+  metadata, the host veth, another gateway port and the mirror's own address
+  failed. An earlier 39-check run on a draft broker passed too; that draft was
+  superseded by PR #5.
+- Deployed to the test host's installed service with v5 as the default image.
+  Through its HTTP API, a token issued with `--allow-packages` was refused
+  `network=on` (403). A `packages` VM ran `pip install requests` in a venv and
+  `npm install is-number`, and could not resolve names or reach `1.1.1.1`,
+  metadata or the mirror address directly. No rules, tables or namespaces
+  remained after destroy.
+
 ## Job broker pipe after review fixes — 2026-10-19
 
 - Ruff lint/format and **159 unit tests passed**, no skips (development Python

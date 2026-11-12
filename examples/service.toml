@@ -6,6 +6,7 @@ max_vms = 16
 max_memory_mib = 16384
 max_storage_gib = 64
 port = 8090
+# listen = ["127.0.0.1"]  # default; ["0.0.0.0", "::"] is every interface, cleartext HTTP
 # uplink = "eth0"  # required only for network=on; IPv4 forwarding must already be enabled
 # blocked_cidrs = ["YOUR_PUBLIC_MANAGEMENT_SUBNET/24"]
 # allowed_hosts = ["127.0.0.1:8090", "vms.example.com"]  # TLS reverse proxy Host header
@@ -16,6 +17,12 @@ port = 8090
 # max_streams_per_workspace = 8
 # max_streams_per_vm = 4
 # stream_rate_bytes = 33554432  # per direction per stream; 0 is unlimited
+
+# network="packages": read-only pull-through mirrors, the only egress these VMs
+# get. http:// with an IPv4 literal (not loopback) and an explicit port.
+# [packages]
+# pypi = "http://192.0.2.10:3141/root/pypi/+simple/"
+# npm = "http://192.0.2.10:4873/"
 
 # One table per bootable image; microvm-mcp-install-image prints it. rootfs and
 # kernel default to <state_dir>/images/<id>/rootfs.ext4 and vmlinux.
